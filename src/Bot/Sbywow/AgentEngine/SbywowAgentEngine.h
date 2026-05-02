@@ -72,6 +72,24 @@ namespace Sbywow
         // wasn't waiting on this id.
         bool CancelWaitIfMatch(uint64_t intentId);
 
+        // ---- Observability accessors -----------------------------
+        //
+        // Read-only views into engine state for inspect / snapshot.
+        // All callers run on the world thread (TickBot dispatch and
+        // OnPlayerUpdate snapshot emit), same thread that mutates
+        // these fields in DoNextAction / CancelWaitIfMatch — no
+        // synchronization needed.
+        bool        IsWaiting()           const { return isWaiting_; }
+        uint64_t    WaitingIntentId()     const { return waitingIntentId_; }
+        std::string const& WaitingIntentVerb() const { return waitingIntentVerb_; }
+        // Returns 0 when not waiting; otherwise milliseconds until
+        // the suspension expires (clamped at 0 if already past).
+        int64_t     WaitingRemainingMs()  const;
+
+        uint64_t    TicksTotal()              const { return ticksTotal_; }
+        uint64_t    IntentsDispatchedTotal()  const { return intentsDispatchedTotal_; }
+        uint64_t    ReactivesFiredTotal()     const { return reactivesFiredTotal_; }
+
     private:
         std::string ExecuteMove    (Player* bot, Intent const& intent);
         std::string ExecuteInteract(Player* bot, Intent const& intent);
@@ -102,6 +120,13 @@ namespace Sbywow
         // intent_completed when isWaiting_ lifts.
         uint64_t                               waitingIntentId_   = 0;
         std::string                            waitingIntentVerb_;
+
+        // Cumulative counters surfaced via inspect for "is the engine
+        // ticking? are intents flowing?" sanity. World-thread only;
+        // no atomics needed.
+        uint64_t                               ticksTotal_              = 0;
+        uint64_t                               intentsDispatchedTotal_  = 0;
+        uint64_t                               reactivesFiredTotal_     = 0;
     };
 }
 

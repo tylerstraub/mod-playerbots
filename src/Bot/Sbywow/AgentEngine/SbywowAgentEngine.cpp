@@ -96,6 +96,10 @@ namespace Sbywow
         if (!bot)
             return false;
 
+        // Count every tick that reached real work — answers
+        // "is this engine actually being ticked?" for inspect.
+        ++ticksTotal_;
+
         if (!tickedOnce_)
         {
             tickedOnce_ = true;
@@ -170,6 +174,10 @@ namespace Sbywow
                                        pending->intentId, pending->verb);
             session->PushOutbound(ev.dump());
         }
+
+        // Count the dispatch — covers all five kinds (Wait included,
+        // since arming the suspension is itself a dispatch).
+        ++intentsDispatchedTotal_;
 
         // Wait is special-cased: arm the suspension. Subsequent
         // intents in the queue wait their turn until suspension
@@ -478,8 +486,20 @@ namespace Sbywow
         // strategy fires from "low health" / "low mana" triggers;
         // we skip the trigger layer because we don't have the
         // strategy stack — direct DoSpecificAction is enough.
+        ++reactivesFiredTotal_;
         Event ev;
         ai->DoSpecificAction("food",  ev, /*silent=*/true);
         ai->DoSpecificAction("drink", ev, /*silent=*/true);
+    }
+
+    int64_t SbywowAgentEngine::WaitingRemainingMs() const
+    {
+        if (!isWaiting_)
+            return 0;
+        auto now = std::chrono::steady_clock::now();
+        if (now >= waitUntil_)
+            return 0;
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   waitUntil_ - now).count();
     }
 }

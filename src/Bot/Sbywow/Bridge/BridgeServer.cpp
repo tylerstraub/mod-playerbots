@@ -268,6 +268,7 @@ namespace Sbywow::Bridge
             };
 
             json engineInfo;
+            json agentEngineState;  // populated only when non_combat is SbywowAgentEngine
             if (ai)
             {
                 Engine* combat    = ai->GetEngine(BOT_STATE_COMBAT);
@@ -289,6 +290,26 @@ namespace Sbywow::Bridge
                     }}
                 };
 
+                // When non_combat is our SbywowAgentEngine, surface its
+                // wait-suspension state plus tick counters. Closes the
+                // "why isn't my move_to executing?" question without an
+                // SSE-scrub round trip. waitingIntentId stringified for
+                // wire consistency with the rest of the intent contract.
+                if (auto* agentEng = dynamic_cast<Sbywow::SbywowAgentEngine*>(nonCombat))
+                {
+                    agentEngineState = {
+                        {"is_waiting",               agentEng->IsWaiting()},
+                        {"waiting_intent_id",        agentEng->WaitingIntentId() != 0
+                                                     ? json(std::to_string(agentEng->WaitingIntentId()))
+                                                     : json(nullptr)},
+                        {"waiting_intent_verb",      agentEng->WaitingIntentVerb()},
+                        {"waiting_remaining_ms",     agentEng->WaitingRemainingMs()},
+                        {"ticks_total",              agentEng->TicksTotal()},
+                        {"intents_dispatched_total", agentEng->IntentsDispatchedTotal()},
+                        {"reactives_fired_total",    agentEng->ReactivesFiredTotal()}
+                    };
+                }
+
                 Player* master = ai->GetMaster();
                 botInfo["has_master"]  = (master != nullptr);
                 botInfo["master_name"] = master ? master->GetName() : "";
@@ -307,14 +328,17 @@ namespace Sbywow::Bridge
                 {"intent_count",   static_cast<int>(sess.IntentCount())}
             };
 
-            return json{
+            json out = {
                 {"ok",       true},
                 {"verb",     "inspect"},
                 {"bot",      botInfo},
                 {"engines",  engineInfo},
                 {"sbywow",   sbywowInfo},
                 {"session",  sessionInfo}
-            }.dump();
+            };
+            if (!agentEngineState.is_null())
+                out["agent_engine"] = std::move(agentEngineState);
+            return out.dump();
         }
 
         // ---- Autonomous-driving primitives ------------------------
@@ -1068,14 +1092,13 @@ namespace Sbywow::Bridge
             // world thread, not an "execution budget." Sync verbs run
             // entirely on the world thread and finish in <50ms typical
             // (worst case ~500ms for find_nearby with a wide range).
-            // Intent verbs in the current sync-response model also
-            // resolve here when the engine completes the intent — but
-            // the upcoming async-via-events refactor (next-session
-            // target; see roadmap "Async intent contract") moves
-            // intent completion onto the SSE stream, leaving this
-            // timeout to cover only dispatch + sync-verb execution.
-            // 3s gives ~60 ticks of headroom for normal world-thread
-            // hiccups while surfacing genuine wedges quickly.
+            // Intent verbs return their {ok, intent_id, queued} ack
+            // immediately — engine completion lands later as an SSE
+            // event (intent_completed/failed/cancelled), so this
+            // timeout only covers the dispatch + sync-verb execution
+            // path. 3s gives ~60 ticks of headroom for normal
+            // world-thread hiccups while surfacing genuine wedges
+            // quickly.
             auto fut = session->PushInbound(req.body);
             if (fut.wait_for(std::chrono::seconds(3)) == std::future_status::timeout)
             {

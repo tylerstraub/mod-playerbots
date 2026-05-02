@@ -18,7 +18,10 @@
 #include "BotSession.h"
 #include "deps/json.hpp"
 
+#include "../AgentEngine/SbywowAgentEngine.h"
+
 #include "Creature.h"
+#include "Engine.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
@@ -163,6 +166,25 @@ namespace
             ev["in_combat"] = player->IsInCombat();
             ev["alive"]     = player->IsAlive();
             ev["level"]     = player->GetLevel();
+
+            // Engine progress fields — agent harness uses these to
+            // reason about "is my queued intent making progress?"
+            // without round-tripping through inspect or scrubbing
+            // the SSE history.
+            if (auto session = BridgeServer::Instance().GetSession(player->GetGUID()))
+                ev["intent_count"] = static_cast<int>(session->IntentCount());
+            if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(player))
+            {
+                if (auto* agentEng = dynamic_cast<Sbywow::SbywowAgentEngine*>(
+                        ai->GetEngine(BOT_STATE_NON_COMBAT)))
+                {
+                    ev["is_waiting"]           = agentEng->IsWaiting();
+                    ev["waiting_intent_id"]    = agentEng->WaitingIntentId() != 0
+                                                 ? json(std::to_string(agentEng->WaitingIntentId()))
+                                                 : json(nullptr);
+                    ev["waiting_remaining_ms"] = agentEng->WaitingRemainingMs();
+                }
+            }
             EmitEvent(player, ev);
         }
 
