@@ -325,10 +325,11 @@ namespace Sbywow::Bridge
         // !HasRealPlayerMaster() gates. See decisions.md
         // "Master-bond suppresses roaming" for the architectural why.
         //
-        // All three are pure additive Bucket 1 — they call existing
-        // public Player / WorldSession / MotionMaster surface that AC's
-        // own opcode handlers and mod-playerbots' own actions use. None
-        // touch upstream files. None require seize.
+        // All five (move/interact/say/do_action/wait) ride existing
+        // public Player / WorldSession / MotionMaster surface that
+        // AC's own opcode handlers and mod-playerbots' own actions
+        // use. The bridge side is a thin queue-pusher; actual
+        // execution lives in SbywowAgentEngine on the world thread.
 
         // Defer a verb to the engine: package the intent into a
         // PendingIntent, transfer the inbound PendingCommand's
