@@ -399,6 +399,11 @@ public:
     void ChangeEngine(BotState type);
     void ChangeEngineOnCombat();
     void ChangeEngineOnNonCombat();
+    // sbywow: expose per-state engine for ActionExecutionListener
+    // registration. Hook count: 1 of ~10 lifetime budget. See
+    // sbywow/docs/fork-discipline.md and decisions.md (Agent Bridge
+    // seize implementation).
+    Engine* GetEngine(BotState type) const { return engines[type]; }
     void DoNextAction(bool minimal = false);
     virtual bool DoSpecificAction(std::string const name, Event event = Event(), bool silent = false,
                                   std::string const qualifier = "");

@@ -18,6 +18,9 @@
 #include "BotSession.h"
 #include "deps/json.hpp"
 
+#include "Action.h"
+#include "Engine.h"
+#include "Event.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
@@ -38,6 +41,48 @@ namespace
     bool IsAttachedBot(Player* player)
     {
         return player && sPlayerbotsMgr.GetPlayerbotAI(player) != nullptr;
+    }
+
+    // Action listener that vetoes any non-agent-originated action while
+    // the bot is seized. Engine takes ownership on
+    // AddActionExecutionListener and deletes it on engine destruction —
+    // do not delete from outside. Holds a weak_ptr so a late-firing
+    // listener after detach is a safe no-op.
+    class BridgeActionListener : public ActionExecutionListener
+    {
+    public:
+        explicit BridgeActionListener(std::weak_ptr<BotSession> session)
+            : session_(std::move(session)) {}
+
+        bool Before(Action* /*action*/, Event /*event*/) override { return true; }
+
+        bool AllowExecution(Action* /*action*/, Event /*event*/) override
+        {
+            auto sess = session_.lock();
+            if (!sess) return true;                  // bot detached, don't interfere
+            if (!sess->IsSeized()) return true;      // not seized, normal flow
+            return sess->IsAgentActionInFlight();    // seized: only agent actions pass
+        }
+
+        void After(Action* /*action*/, bool /*executed*/, Event /*event*/) override {}
+        bool OverrideResult(Action* /*action*/, bool executed, Event /*event*/) override { return executed; }
+
+    private:
+        std::weak_ptr<BotSession> session_;
+    };
+
+    // Register one listener per engine state (combat, non-combat, dead).
+    // Currently-active engine changes during play; registering on all
+    // ensures we keep coverage. Engine owns the pointers.
+    void RegisterListenersForBot(Player* bot, std::shared_ptr<BotSession> const& session)
+    {
+        PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (!ai) return;
+        for (uint8 i = 0; i < BOT_STATE_MAX; ++i)
+        {
+            if (Engine* e = ai->GetEngine(static_cast<BotState>(i)))
+                e->AddActionExecutionListener(new BridgeActionListener(session));
+        }
     }
 
     void EmitEvent(Player* bot, json const& payload)
@@ -116,9 +161,13 @@ namespace
                 return;
 
             // Idempotent attach. Returns true only on first sight; emit
-            // the lifecycle "attached" event with bootstrap context.
+            // the lifecycle "attached" event with bootstrap context and
+            // register the seize-veto listener on each engine.
             if (BridgeServer::Instance().AttachBot(player))
             {
+                if (auto session = BridgeServer::Instance().GetSession(player->GetGUID()))
+                    RegisterListenersForBot(player, session);
+
                 json ev = BaseEvent(player, "lifecycle", "attached");
                 ev["map"]  = player->GetMapId();
                 ev["zone"] = player->GetZoneId();

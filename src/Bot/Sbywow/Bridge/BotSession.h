@@ -71,6 +71,16 @@ namespace Sbywow::Bridge
         void   SetSseAttached(bool v) { sseAttached_.store(v); }
         bool   IsSseAttached() const { return sseAttached_.load(); }
 
+        // Seize state. While seized, the BridgeActionListener vetoes any
+        // action that wasn't tagged agent-originated, suppressing
+        // strategy/trigger output. AgentActionInFlight is the tag — set
+        // only during the synchronous DoSpecificAction call from the
+        // command dispatcher (use ScopedAgentAction).
+        void   SetSeized(bool v) { seized_.store(v); }
+        bool   IsSeized() const { return seized_.load(); }
+        void   SetAgentActionInFlight(bool v) { agentActionInFlight_.store(v); }
+        bool   IsAgentActionInFlight() const { return agentActionInFlight_.load(); }
+
         // Convenience: bounded outbound queue cap. Drop oldest on overflow.
         static constexpr size_t kOutboundCap = 1024;
 
@@ -87,6 +97,23 @@ namespace Sbywow::Bridge
         std::atomic<int64_t>                        lastAliveMs_{0};
         std::atomic<bool>                           isAfk_{false};
         std::atomic<bool>                           sseAttached_{false};
+        std::atomic<bool>                           seized_{false};
+        std::atomic<bool>                           agentActionInFlight_{false};
+    };
+
+    // RAII tag for "this code is running an agent-originated action."
+    // The BridgeActionListener checks this on AllowExecution to bypass
+    // the seize veto for agent commands. Construct around the
+    // DoSpecificAction call; destruction clears the flag even if the
+    // call returns early.
+    struct ScopedAgentAction
+    {
+        explicit ScopedAgentAction(BotSession& s) : sess_(s) { sess_.SetAgentActionInFlight(true); }
+        ~ScopedAgentAction() { sess_.SetAgentActionInFlight(false); }
+        ScopedAgentAction(ScopedAgentAction const&) = delete;
+        ScopedAgentAction& operator=(ScopedAgentAction const&) = delete;
+    private:
+        BotSession& sess_;
     };
 }
 

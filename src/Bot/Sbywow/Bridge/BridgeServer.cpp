@@ -163,9 +163,23 @@ namespace Sbywow::Bridge
 
     namespace
     {
+        // Push a control-channel event onto the bot's outbound queue so
+        // the agent's SSE stream sees state transitions it didn't
+        // request directly (e.g., heartbeat-driven force-release).
+        void EmitControlEvent(BotSession& sess, std::string const& kind, std::string const& reason)
+        {
+            json ev = {
+                {"channel",  "control"},
+                {"kind",     kind},
+                {"bot_guid", sess.Guid().GetRawValue()},
+                {"reason",   reason}
+            };
+            sess.PushOutbound(ev.dump());
+        }
+
         // Translate a verb JSON into a result JSON. Runs on the world
         // thread, so any Playerbots API is fair game.
-        std::string DispatchCommand(Player* bot, std::string const& cmdJson)
+        std::string DispatchCommand(Player* bot, BotSession& sess, std::string const& cmdJson)
         {
             json req;
             try { req = json::parse(cmdJson); }
@@ -180,6 +194,26 @@ namespace Sbywow::Bridge
             if (verb == "ping")
             {
                 json ok = { {"ok", true} };
+                return ok.dump();
+            }
+
+            if (verb == "seize")
+            {
+                bool wasSeized = sess.IsSeized();
+                sess.SetSeized(true);
+                if (!wasSeized)
+                    EmitControlEvent(sess, "seize_acquired", "explicit");
+                json ok = { {"ok", true}, {"verb", "seize"}, {"seized", true} };
+                return ok.dump();
+            }
+
+            if (verb == "release")
+            {
+                bool wasSeized = sess.IsSeized();
+                sess.SetSeized(false);
+                if (wasSeized)
+                    EmitControlEvent(sess, "seize_released", "explicit");
+                json ok = { {"ok", true}, {"verb", "release"}, {"seized", false} };
                 return ok.dump();
             }
 
@@ -200,8 +234,15 @@ namespace Sbywow::Bridge
                     return err.dump();
                 }
 
+                // Tag the call as agent-originated so the listener bypass
+                // the seize veto. Scope ensures the flag clears even if
+                // DoSpecificAction throws (it shouldn't, but cheap safety).
                 Event ev;
-                bool result = ai->DoSpecificAction(name, ev, /*silent=*/true, qualifier);
+                bool result;
+                {
+                    ScopedAgentAction tag(sess);
+                    result = ai->DoSpecificAction(name, ev, /*silent=*/true, qualifier);
+                }
                 json ok = {
                     {"ok",        result},
                     {"verb",      "do_action"},
@@ -234,7 +275,7 @@ namespace Sbywow::Bridge
         std::shared_ptr<PendingCommand> cmd;
         while (session->PopInbound(cmd))
         {
-            std::string out = DispatchCommand(bot, cmd->json);
+            std::string out = DispatchCommand(bot, *session, cmd->json);
             try { cmd->result.set_value(std::move(out)); }
             catch (std::future_error const&) { /* receiver gone — ignore */ }
         }
@@ -247,6 +288,13 @@ namespace Sbywow::Bridge
             session->SetAfk(true);
             bot->ToggleAFK();
             bot->autoReplyMsg = "Agent unresponsive — autonomic only";
+            // Force-release seize on heartbeat loss so a dead harness
+            // doesn't pin the bot in a frozen state.
+            if (session->IsSeized())
+            {
+                session->SetSeized(false);
+                EmitControlEvent(*session, "seize_released", "heartbeat_timeout");
+            }
         }
         else if (!stale && wasAfk)
         {
@@ -374,7 +422,8 @@ namespace Sbywow::Bridge
                         {"guid",            key},
                         {"heartbeat_ms",    sess->HeartbeatAgeMs()},
                         {"afk",             sess->IsAfk()},
-                        {"sse_attached",    sess->IsSseAttached()}
+                        {"sse_attached",    sess->IsSseAttached()},
+                        {"seized",          sess->IsSeized()}
                     });
                 }
             }
