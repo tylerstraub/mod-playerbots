@@ -109,11 +109,8 @@ namespace Sbywow
         // Wait suspension: while engaged, no intents drain. Wait is
         // explicit agent-issued sequencing — "do A, hold for N ms,
         // then do B" — implemented as a pause on intent dispatch.
-        // The Wait intent's promise is set at *start* of suspension
-        // (so the agent's HTTP call returns immediately with "queued
-        // for N ms"), and chained intents queue behind it until
-        // suspension lifts. Uses steady_clock to avoid getMSTime's
-        // uint32 wraparound — small bug but free to avoid.
+        // Chained intents queue behind it until suspension lifts.
+        // Uses steady_clock to avoid getMSTime's uint32 wraparound.
         if (isWaiting_)
         {
             if (std::chrono::steady_clock::now() < waitUntil_)
@@ -121,7 +118,7 @@ namespace Sbywow
             isWaiting_ = false;
 
             // Wait reached its end naturally — emit intent_completed
-            // tagged with the wait's id. Phase 4 cancellation will
+            // tagged with the wait's id. Phase 3 cancellation will
             // also clear isWaiting_ but emits intent_cancelled
             // there instead, so we're safe to claim "completed" here.
             if (session && waitingIntentId_ != 0)
@@ -136,10 +133,10 @@ namespace Sbywow
         }
 
         // Pop one intent per tick from the per-bot session queue,
-        // execute it, set the promise so the HTTP-side verb returns.
+        // execute it, emit the corresponding SSE intent_* event.
         // BridgeServer is the canonical owner of sessions; if the
         // bridge is down or the session was detached out from under
-        // us, we silently no-op (intent was implicitly cancelled).
+        // us, we silently no-op (intent is implicitly cancelled).
         if (!session)
             return false;
 
@@ -165,9 +162,9 @@ namespace Sbywow
             session->PushOutbound(ev.dump());
         }
 
-        // Wait is special-cased: arm the suspension and respond
-        // immediately. Subsequent intents in the queue wait their
-        // turn until suspension lifts in a future tick.
+        // Wait is special-cased: arm the suspension. Subsequent
+        // intents in the queue wait their turn until suspension
+        // lifts in a future tick (where intent_completed fires).
         if (pending->intent.kind == IntentKind::Wait)
         {
             isWaiting_         = true;
@@ -175,23 +172,17 @@ namespace Sbywow
                                  std::chrono::milliseconds(pending->intent.waitMs);
             waitingIntentId_   = pending->intentId;
             waitingIntentVerb_ = pending->verb;
-            json out = {
-                {"ok",       true},
-                {"verb",     "wait"},
-                {"wait_ms",  pending->intent.waitMs}
-            };
-            try { pending->result.set_value(out.dump()); }
-            catch (std::future_error const&) {}
             return true;
         }
 
         std::string outStr = ExecuteIntent(bot, pending->intent);
 
         // Translate the verb's `ok` flag into intent_completed vs
-        // intent_failed. Embed the full result payload so consumers
-        // get the same JSON they'd see on the (Phase-1) sync HTTP
-        // response. Parse defensively — engine outputs valid JSON,
-        // but a malformed string shouldn't take down the bridge.
+        // intent_failed. Embed the full result payload so SSE
+        // consumers get the same JSON we used to return synchronously
+        // on the HTTP response. Parse defensively — engine outputs
+        // valid JSON, but a malformed string shouldn't take down
+        // the bridge.
         json result;
         try { result = json::parse(outStr); }
         catch (std::exception const&) { result = {{"ok", false}, {"error", "engine returned non-JSON"}}; }
@@ -201,9 +192,6 @@ namespace Sbywow
                                    pending->intentId, pending->verb);
         ev["result"] = result;
         session->PushOutbound(ev.dump());
-
-        try { pending->result.set_value(std::move(outStr)); }
-        catch (std::future_error const&) { /* receiver gone — drop */ }
 
         return true;
     }

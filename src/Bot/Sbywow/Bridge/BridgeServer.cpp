@@ -35,7 +35,6 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
-#include <optional>
 #include <regex>
 #include <sstream>
 #include <utility>
@@ -331,39 +330,30 @@ namespace Sbywow::Bridge
         // use. The bridge side is a thin queue-pusher; actual
         // execution lives in SbywowAgentEngine on the world thread.
 
-        // Defer a verb to the engine: package the intent into a
-        // PendingIntent, transfer the inbound PendingCommand's
-        // promise into it (HTTP-side future stays bound to the
-        // same shared state — set_value on the moved promise
-        // unblocks the HTTP response), push to the session's
-        // intent queue, and signal "deferred" to the caller.
-        // After this move, cmd->result is in a moved-from state
-        // and must not be touched.
-        //
-        // Phase 1 of the async-via-events refactor:
-        //  - Mint an intent_id and stamp it on the PendingIntent
-        //    along with the verb name.
-        //  - Emit an `intent_queued` SSE event so consumers can
-        //    correlate by id.
-        // The HTTP-side promise still resolves at engine
-        // completion (Phase 2 cuts that path); SSE events run
-        // alongside.
-        std::optional<std::string> Defer(Player* bot,
-                                         BotSession& sess,
-                                         std::shared_ptr<PendingCommand>& cmd,
-                                         std::string verb,
-                                         Sbywow::Intent intent)
+        // Queue an intent for engine execution. Returns the
+        // {ok, intent_id, verb} ack immediately — the inbound
+        // PendingCommand's promise is set with this string by
+        // TickBot, unblocking the HTTP response within microseconds.
+        // Engine completion is delivered separately via SSE
+        // (intent_completed / intent_failed events keyed by
+        // intent_id). See decisions.md "Async-via-events"
+        // (2026-05-02) for the protocol shape.
+        std::string Defer(Player* bot,
+                          BotSession& sess,
+                          std::shared_ptr<PendingCommand>& /*cmd*/,
+                          std::string const& verb,
+                          Sbywow::Intent intent)
         {
             uint64_t id = BridgeServer::Instance().MintIntentId();
 
             auto pending = std::make_shared<PendingIntent>();
             pending->intent   = std::move(intent);
-            pending->result   = std::move(cmd->result);
             pending->intentId = id;
             pending->verb     = verb;
 
-            // Emit intent_queued before queueing, so a fast engine
-            // tick can't slip an intent_started in front of us.
+            // Emit intent_queued before pushing to the engine queue,
+            // so a fast engine tick can't slip an intent_started in
+            // front of us.
             json ev = {
                 {"channel",   "intent"},
                 {"kind",      "intent_queued"},
@@ -375,12 +365,18 @@ namespace Sbywow::Bridge
             sess.PushOutbound(ev.dump());
 
             sess.PushIntent(std::move(pending));
-            return std::nullopt;
+
+            return json{
+                {"ok",        true},
+                {"verb",      verb},
+                {"intent_id", std::to_string(id)},
+                {"queued",    true}
+            }.dump();
         }
 
-        std::optional<std::string> QueueMoveIntent(Player* bot, BotSession& sess,
-                                                   std::shared_ptr<PendingCommand>& cmd,
-                                                   json const& req)
+        std::string QueueMoveIntent(Player* bot, BotSession& sess,
+                                    std::shared_ptr<PendingCommand>& cmd,
+                                    json const& req)
         {
             if (!req.contains("x") || !req.contains("y") || !req.contains("z") ||
                 !req["x"].is_number() || !req["y"].is_number() || !req["z"].is_number())
@@ -396,9 +392,9 @@ namespace Sbywow::Bridge
             return Defer(bot, sess, cmd, "move_to", std::move(i));
         }
 
-        std::optional<std::string> QueueInteractIntent(Player* bot, BotSession& sess,
-                                                       std::shared_ptr<PendingCommand>& cmd,
-                                                       json const& req)
+        std::string QueueInteractIntent(Player* bot, BotSession& sess,
+                                        std::shared_ptr<PendingCommand>& cmd,
+                                        json const& req)
         {
             if (!req.contains("guid") || !req["guid"].is_number())
                 return json{{"ok", false}, {"error", "interact_with requires numeric guid"}}.dump();
@@ -409,9 +405,9 @@ namespace Sbywow::Bridge
             return Defer(bot, sess, cmd, "interact_with", std::move(i));
         }
 
-        std::optional<std::string> QueueSayIntent(Player* bot, BotSession& sess,
-                                                  std::shared_ptr<PendingCommand>& cmd,
-                                                  json const& req)
+        std::string QueueSayIntent(Player* bot, BotSession& sess,
+                                   std::shared_ptr<PendingCommand>& cmd,
+                                   json const& req)
         {
             std::string text = req.value("text", "");
             if (text.empty())
@@ -424,9 +420,9 @@ namespace Sbywow::Bridge
             return Defer(bot, sess, cmd, "say", std::move(i));
         }
 
-        std::optional<std::string> QueueDoActionIntent(Player* bot, BotSession& sess,
-                                                       std::shared_ptr<PendingCommand>& cmd,
-                                                       json const& req)
+        std::string QueueDoActionIntent(Player* bot, BotSession& sess,
+                                        std::shared_ptr<PendingCommand>& cmd,
+                                        json const& req)
         {
             std::string name = req.value("name", "");
             if (name.empty())
@@ -439,9 +435,9 @@ namespace Sbywow::Bridge
             return Defer(bot, sess, cmd, "do_action", std::move(i));
         }
 
-        std::optional<std::string> QueueWaitIntent(Player* bot, BotSession& sess,
-                                                   std::shared_ptr<PendingCommand>& cmd,
-                                                   json const& req)
+        std::string QueueWaitIntent(Player* bot, BotSession& sess,
+                                    std::shared_ptr<PendingCommand>& cmd,
+                                    json const& req)
         {
             if (!req.contains("ms") || !req["ms"].is_number_unsigned())
                 return json{{"ok", false}, {"error", "wait requires unsigned ms"}}.dump();
@@ -627,15 +623,15 @@ namespace Sbywow::Bridge
         // into a clean 503 instead of bringing down the realm. The
         // narrower per-verb wrappers (Save/Load) cover the highest-risk
         // sites first; this is belt-and-suspenders for the rest.
-        // Returns nullopt if the verb was deferred to the engine
-        // (intent queued; engine will set the promise via the
-        // PendingIntent). Returns a string for sync verbs — caller
-        // sets it on the PendingCommand's promise.
-        std::optional<std::string> DispatchCommandInner(Player* bot, BotSession& sess,
-                                                        std::shared_ptr<PendingCommand>& cmd);
+        // Always returns the string the HTTP handler should send back.
+        // Intent verbs return {ok, intent_id, queued:true} immediately
+        // (engine completion fires later as an SSE event). Sync verbs
+        // return their full result inline.
+        std::string DispatchCommandInner(Player* bot, BotSession& sess,
+                                         std::shared_ptr<PendingCommand>& cmd);
 
-        std::optional<std::string> DispatchCommand(Player* bot, BotSession& sess,
-                                                   std::shared_ptr<PendingCommand>& cmd)
+        std::string DispatchCommand(Player* bot, BotSession& sess,
+                                    std::shared_ptr<PendingCommand>& cmd)
         {
             try { return DispatchCommandInner(bot, sess, cmd); }
             catch (std::exception const& e)
@@ -645,8 +641,8 @@ namespace Sbywow::Bridge
             }
         }
 
-        std::optional<std::string> DispatchCommandInner(Player* bot, BotSession& sess,
-                                                        std::shared_ptr<PendingCommand>& cmd)
+        std::string DispatchCommandInner(Player* bot, BotSession& sess,
+                                         std::shared_ptr<PendingCommand>& cmd)
         {
             json req;
             try { req = json::parse(cmd->json); }
@@ -882,23 +878,16 @@ namespace Sbywow::Bridge
         if (!session)
             return;
 
-        // Drain inbound commands. Each command's promise is set with a
-        // result JSON the httplib handler is blocked on. Intent verbs
-        // (move_to today; more in Phase 3) defer — they move the
-        // promise into a PendingIntent on the bot's intent queue,
-        // and the SbywowAgentEngine sets the promise when it pops
-        // the intent next tick. DispatchCommand returns nullopt in
-        // that case; we leave the promise alone here.
+        // Drain inbound commands. Every dispatch returns the string
+        // the HTTP handler is blocked on. Intent verbs return their
+        // ack immediately ({ok, intent_id, queued:true}); engine
+        // completion is delivered out-of-band via SSE.
         std::shared_ptr<PendingCommand> cmd;
         while (session->PopInbound(cmd))
         {
-            auto out = DispatchCommand(bot, *session, cmd);
-            if (out.has_value())
-            {
-                try { cmd->result.set_value(std::move(*out)); }
-                catch (std::future_error const&) { /* receiver gone */ }
-            }
-            // else: deferred — engine owns the promise now.
+            std::string out = DispatchCommand(bot, *session, cmd);
+            try { cmd->result.set_value(std::move(out)); }
+            catch (std::future_error const&) { /* receiver gone */ }
         }
 
         // AFK degradation. Heartbeat-driven: stale heartbeat sets the

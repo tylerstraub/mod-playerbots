@@ -40,28 +40,23 @@ namespace Sbywow::Bridge
     };
 
     // An agent-bonded engine intent awaiting execution. The HTTP
-    // handler — having received an intent verb (move_to today; more
-    // in Phase 3) — pushes one of these into the bot's intent queue.
-    // SbywowAgentEngine::DoNextAction pops one per tick, executes it,
-    // and sets the result promise. The HTTP handler's future is
-    // bound to that promise (moved out of the inbound PendingCommand
-    // when the verb dispatched), so the agent's HTTP call unblocks
-    // when the engine completes the intent — same external timing as
-    // synchronous verbs were before, just with the intent queue in
-    // the middle.
+    // handler — having received an intent verb — assigns an intent_id,
+    // pushes a PendingIntent onto the bot's queue, and returns
+    // {ok, intent_id} to the caller immediately. SbywowAgentEngine
+    // pops one per tick and emits SSE events on the `intent` channel
+    // (intent_started, intent_completed/failed, intent_cancelled) so
+    // the agent harness can correlate completion to the queued id.
     //
-    // intentId / verb are populated at queue time (BridgeServer's
-    // Defer) and travel with the intent so the engine can emit SSE
-    // intent_started / intent_completed / intent_failed events tagged
-    // with the right id and verb. Phase 1 adds the SSE events
-    // alongside the existing promise; Phase 2 cuts HTTP over to
-    // immediate {ok, intent_id} return and drops the promise.
+    // No promise here: completion travels via SSE, not HTTP. This
+    // is the Phase 2 cutover from the original sync-HTTP model that
+    // forced long-running operations through the 3s dispatch budget.
+    // See decisions.md "Async-via-events" (2026-05-02) for the
+    // architectural reasoning.
     struct PendingIntent
     {
-        Sbywow::Intent             intent;
-        std::promise<std::string>  result;
-        uint64_t                   intentId = 0;
-        std::string                verb;
+        Sbywow::Intent  intent;
+        uint64_t        intentId = 0;
+        std::string     verb;
     };
 
     class BotSession : public std::enable_shared_from_this<BotSession>
