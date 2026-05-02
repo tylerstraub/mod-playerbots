@@ -188,7 +188,14 @@ uint32 MercenaryMgr::GetMercCount(ObjectGuid ownerGuid) const
 
 void MercenaryMgr::AddOwnership(ObjectGuid mercGuid, ObjectGuid ownerGuid, uint8 classId)
 {
-    CharacterDatabase.Execute(
+    // DirectExecute is synchronous — the row is visible to subsequent reads
+    // before this returns. Required because CreateMerc immediately invokes
+    // HandlePlayerbotCommand("add ...") for auto-summon, which calls our
+    // IsOwnedBy on the SYNC connection. Async Execute would queue the INSERT
+    // on the async connection and the sync SELECT would race past it,
+    // failing the AddPlayerBot allowed-check with "not allowed to control X"
+    // and silently swallowing the auto-summon.
+    CharacterDatabase.DirectExecute(
         "INSERT INTO mod_sbywow_mercenaries (merc_guid, owner_guid, class_id) "
         "VALUES ({}, {}, {})",
         mercGuid.GetCounter(), ownerGuid.GetCounter(), uint32(classId));
@@ -316,9 +323,12 @@ void MercenaryMgr::ReapOrphans()
             "Sbywow: orphan reaper sweep 1 (dead owner): {} merc(s) dismissed", reaped);
     }
 
-    // Drain async writes from sweep 1 (DismissMerc → RemoveOwnership uses
-    // CharacterDatabase.Execute, async). Without this drain, sweep 2's sync
-    // SELECT below would re-find the same rows and double-log them.
+    // Defensive drain. RemoveOwnership is sync (DirectExecute), so the
+    // ownership-row deletes from sweep 1 are already committed by the time
+    // we get here. But DismissMerc also kicks off Player::DeleteFromDB which
+    // cascades through ~30 prepared statements; DismissMerc drains those
+    // internally before returning, but a future change might add async work
+    // after that drain. This catch-all keeps sweep 2 honest in that case.
     using namespace std::chrono_literals;
     while (CharacterDatabase.QueueSize())
         std::this_thread::sleep_for(50ms);

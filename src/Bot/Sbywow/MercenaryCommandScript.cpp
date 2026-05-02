@@ -209,7 +209,13 @@ public:
                 merc->GetPositionX(), merc->GetPositionY(), merc->GetPositionZ());
             handler->PSendSysMessage("  HP: {}/{} ({}%){}", merc->GetHealth(), merc->GetMaxHealth(), hpPct, deadTag);
             if (Group* grp = merc->GetGroup())
-                handler->PSendSysMessage("  Group leader: guid={}", grp->GetLeaderGUID().GetCounter());
+            {
+                ObjectGuid leaderGuid = grp->GetLeaderGUID();
+                std::string leaderName;
+                sCharacterCache->GetCharacterNameByGuid(leaderGuid, leaderName);
+                handler->PSendSysMessage("  Group leader: '{}' (guid={})",
+                    leaderName.empty() ? "?" : leaderName.c_str(), leaderGuid.GetCounter());
+            }
             else
                 handler->SendSysMessage("  Group: solo");
         }
@@ -429,7 +435,7 @@ public:
         Player* merc = ObjectAccessor::FindConnectedPlayer(mercGuid);
         if (!merc)
         {
-            handler->SendSysMessage("Merc must be online to resync. Re-hire path will sync next summon.");
+            handler->PSendSysMessage("'{}' must be online to resync. Use '.merc summon {}' first.", name, name);
             return true;
         }
 
@@ -527,8 +533,11 @@ public:
     }
 
     // .merc admin nuke <guid> — full cascade-delete a character on the service
-    // account using Player::DeleteFromDB (handles all 30+ related tables). Use
-    // this to clean up orphans left by failed CreateMerc / partial dismiss.
+    // account using Player::DeleteFromDB (handles all 30+ related tables).
+    // The OnPlayerDeleteFromDB hook also cleans the ownership row atomically;
+    // the explicit RemoveOwnership below is belt-and-suspenders. Primary use:
+    // clean up dangling service-account characters flagged by orphan reaper
+    // sweep 3 (untracked chars; not in mod_sbywow_mercenaries).
     static bool HandleAdminNukeCommand(ChatHandler* handler, char const* args)
     {
         std::string a = args ? args : "";

@@ -40,7 +40,7 @@ public:
         {
             Player* merc = ObjectAccessor::FindConnectedPlayer(mercGuid);
             if (!merc)
-                continue;  // offline merc — will pick up new level on .merc resync or next hire-time path
+                continue;  // offline merc — owner can `.merc summon <name>` then `.merc resync <name>` to pull the level up
 
             if (merc->GetLevel() != newLevel)
                 merc->GiveLevel(newLevel);
@@ -171,8 +171,11 @@ public:
     {
         // World is fully loaded and DBs are ready — safe to bootstrap state.
         sMercenaryMgr.EnsureServiceState();
-        // Self-heal: prune any orphan rows accumulated from prior runs (broken
-        // OnPlayerDelete hook, manual SQL, partial CreateMerc failures).
+        // Self-heal: prune any orphan rows accumulated from prior runs.
+        // Common causes: GM `.character erase` of an owner-with-mercs (we
+        // can't cascade-dismiss inside the deletion transaction; see
+        // OnPlayerDeleteFromDB comment), manual SQL, partial CreateMerc
+        // failures (process died between SaveToDB and AddOwnership).
         sMercenaryMgr.ReapOrphans();
     }
 };

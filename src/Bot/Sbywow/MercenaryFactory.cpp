@@ -1,6 +1,5 @@
 #include "MercenaryFactory.h"
 
-#include "AccountMgr.h"
 #include "CharacterCache.h"
 #include "DatabaseEnv.h"
 #include "Guild.h"
