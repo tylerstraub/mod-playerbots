@@ -38,7 +38,13 @@ namespace Sbywow::Bridge
     void BridgeServer::LoadConfig()
     {
         config_.enable             = sConfigMgr->GetOption<bool>       ("Sbywow.Bridge.Enable",             true);
-        config_.host               = sConfigMgr->GetOption<std::string>("Sbywow.Bridge.Host",               "127.0.0.1");
+        // NOTE: Bind to 0.0.0.0 inside the container, not 127.0.0.1.
+        // Podman's port-forward enters the container on a non-loopback
+        // interface; binding to 127.0.0.1 inside accepts the connection
+        // (the listening socket is reachable) but resets the request.
+        // Host-side localhost-only is enforced by `-p 127.0.0.1:8889:8889`
+        // in bin/ac. PBC's HTTP server uses the same pattern.
+        config_.host               = sConfigMgr->GetOption<std::string>("Sbywow.Bridge.Host",               "0.0.0.0");
         config_.port               = sConfigMgr->GetOption<int32>      ("Sbywow.Bridge.Port",               8889);
         config_.secret             = sConfigMgr->GetOption<std::string>("Sbywow.Bridge.Secret",             "");
         config_.heartbeatTimeoutMs = sConfigMgr->GetOption<int32>      ("Sbywow.Bridge.HeartbeatTimeoutMs", 30000);
