@@ -6,11 +6,11 @@
  * declares the intent shape — a tagged union of the primitive
  * actions the harness can request.
  *
- * Phase 2 ships only Move. Phase 3 adds Interact, Say, DoAction,
- * Wait. The struct is a flat record on purpose: one allocation,
- * trivially copyable, no std::variant indirection. Adding kinds is
- * additive — extend the enum and the struct (or add a per-kind
- * sub-struct if/when fields proliferate).
+ * Five kinds today: Move, Interact, Say, DoAction, Wait. The
+ * struct is a flat record on purpose: one allocation, trivially
+ * copyable, no std::variant indirection. Adding kinds is additive
+ * — extend the enum and the struct (or add a per-kind sub-struct
+ * if/when fields proliferate).
  */
 
 #ifndef _SBYWOW_AGENT_ENGINE_INTENT_H

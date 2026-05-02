@@ -11,12 +11,19 @@
  * replace the non-combat engine for agent-bonded bots" (2026-05-02).
  * Design: see docs/agent-engine-design.md.
  *
- * Phase 1: empty DoNextAction; strategy filter rejects all but
- *          "default" so packet-handler plumbing survives.
- * Phase 2 (this file): DoNextAction drains the per-bot Intent queue
- *          (one per tick), dispatches by IntentKind, sets the
- *          PendingIntent's promise so the HTTP-side verb returns.
- * Phase 3+: reactive autonomic eat/drink, more intent kinds.
+ * Behaviors per tick:
+ *  - Strategy filter (addStrategy) admits only the "default" packet-
+ *    handler strategy; cognitive defaults (follow/quest/gather/etc.)
+ *    are dropped so PlayerbotAI::ResetStrategies is a no-op against
+ *    us by construction.
+ *  - DoNextAction drains the per-bot Intent queue (one per tick) and
+ *    emits SSE intent_started / intent_completed / intent_failed events
+ *    on the bridge's outbound stream. Wait intents arm a steady_clock
+ *    suspension; intent_completed fires when the suspension lifts.
+ *  - Cancellation lands via CancelWaitIfMatch (queue-side cancel goes
+ *    through BotSession::RemoveIntentById in the bridge).
+ *  - Reactive autonomic (eat/drink) fires during true idle ticks at
+ *    a low cadence; upstream actions self-gate via isUseful().
  */
 
 #ifndef _SBYWOW_AGENT_ENGINE_H

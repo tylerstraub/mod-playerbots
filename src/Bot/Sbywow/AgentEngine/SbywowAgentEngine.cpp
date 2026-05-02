@@ -118,9 +118,10 @@ namespace Sbywow
             isWaiting_ = false;
 
             // Wait reached its end naturally — emit intent_completed
-            // tagged with the wait's id. Phase 3 cancellation will
-            // also clear isWaiting_ but emits intent_cancelled
-            // there instead, so we're safe to claim "completed" here.
+            // tagged with the wait's id. The cancel path
+            // (CancelWaitIfMatch) clears waitingIntentId_ before
+            // returning, so if we got here with id != 0 the
+            // suspension expired on its own.
             if (session && waitingIntentId_ != 0)
             {
                 json result = json{{"ok", true}, {"verb", "wait"}};

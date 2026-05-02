@@ -47,11 +47,12 @@ namespace Sbywow::Bridge
     // (intent_started, intent_completed/failed, intent_cancelled) so
     // the agent harness can correlate completion to the queued id.
     //
-    // No promise here: completion travels via SSE, not HTTP. This
-    // is the Phase 2 cutover from the original sync-HTTP model that
-    // forced long-running operations through the 3s dispatch budget.
-    // See decisions.md "Async-via-events" (2026-05-02) for the
-    // architectural reasoning.
+    // No promise here: completion travels via SSE, not HTTP. The
+    // earlier sync-HTTP model held the connection open until the
+    // engine completed, which forced long-running operations
+    // through the 3s dispatch budget — this design was the
+    // resolution. See decisions.md "Async-via-events" (2026-05-02)
+    // for the architectural reasoning.
     struct PendingIntent
     {
         Sbywow::Intent  intent;
