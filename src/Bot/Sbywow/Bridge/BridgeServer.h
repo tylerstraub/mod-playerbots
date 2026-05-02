@@ -18,6 +18,7 @@
 #include "deps/json.hpp"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -84,6 +85,14 @@ namespace Sbywow::Bridge
         // sessionsMutex_; callers should hold a strong shared_ptr while in
         // use to keep the session alive across detach.
         std::shared_ptr<BotSession> GetSession(ObjectGuid guid);
+
+        // Iterate every attached bot's Player* on the world thread. Used
+        // by global fan-outs (chat.guild_received, chat.channel_received)
+        // where we need every attached bot, not just one bonded subset.
+        // Safe to call from world-thread paths; resolves Player* via
+        // ObjectAccessor::FindPlayer (returns nullptr if the bot is no
+        // longer in world — those entries are skipped).
+        void ForEachAttachedBot(std::function<void(Player*)> const& fn);
 
         BridgeConfig const& Config() const { return config_; }
 

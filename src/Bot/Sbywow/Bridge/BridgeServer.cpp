@@ -203,6 +203,25 @@ namespace Sbywow::Bridge
         return it->second;
     }
 
+    void BridgeServer::ForEachAttachedBot(std::function<void(Player*)> const& fn)
+    {
+        // Snapshot guids under the lock, then resolve outside — keeps
+        // the lock window short and avoids reentering BridgeServer from
+        // within a chat-hook callback.
+        std::vector<uint64> guids;
+        {
+            std::lock_guard<std::mutex> lock(sessionsMutex_);
+            guids.reserve(sessions_.size());
+            for (auto const& [raw, _] : sessions_)
+                guids.push_back(raw);
+        }
+        for (uint64 raw : guids)
+        {
+            if (Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(raw)))
+                fn(bot);
+        }
+    }
+
     bool BridgeServer::ApplyAgentModeToggle(Player* bot, bool desired, std::string const& source)
     {
         if (!bot)
