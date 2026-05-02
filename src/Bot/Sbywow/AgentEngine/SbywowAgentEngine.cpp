@@ -109,7 +109,13 @@ namespace Sbywow
 
         std::shared_ptr<Sbywow::Bridge::PendingIntent> pending;
         if (!session->PopIntent(pending))
+        {
+            // Idle tick — run reactive autonomic at low cadence.
+            // The agent doesn't have to think about food/drink;
+            // it's a reflex like combat reactions.
+            TickReactiveAutonomic(bot);
             return false;
+        }
 
         // Wait is special-cased: arm the suspension and respond
         // immediately. Subsequent intents in the queue wait their
@@ -362,5 +368,34 @@ namespace Sbywow
             {"name",      intent.actionName},
             {"qualifier", intent.actionQualifier}
         }.dump();
+    }
+
+    void SbywowAgentEngine::TickReactiveAutonomic(Player* bot)
+    {
+        // Throttle: cadence threshold ticks of idle before we even
+        // attempt to fire reactives. Cheap counter increment per
+        // idle tick; the work happens once per ~kReactiveCadenceTicks
+        // ticks (~2.5s at typical bot tick rate).
+        if (++idleTickCount_ < kReactiveCadenceTicks)
+            return;
+        idleTickCount_ = 0;
+
+        if (!bot->IsAlive())
+            return;
+
+        PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (!ai)
+            return;
+
+        // Fire upstream EatAction / DrinkAction. They self-gate via
+        // isUseful() (high-enough HP/mana, has food/water in bags,
+        // not currently eating/drinking) so out-of-context calls
+        // are cheap no-ops. Same actions the upstream "food"
+        // strategy fires from "low health" / "low mana" triggers;
+        // we skip the trigger layer because we don't have the
+        // strategy stack — direct DoSpecificAction is enough.
+        Event ev;
+        ai->DoSpecificAction("food",  ev, /*silent=*/true);
+        ai->DoSpecificAction("drink", ev, /*silent=*/true);
     }
 }

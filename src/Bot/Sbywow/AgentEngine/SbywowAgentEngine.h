@@ -65,12 +65,21 @@ namespace Sbywow
         // it doesn't run synchronously like the other intents; it
         // suspends queue draining for its duration.
 
-        bool                                   tickedOnce_  = false;
-        // Engaged means the engine is in a wait-suspension; no
-        // intents are popped until steady_clock::now() >= waitUntil_.
+        // Reactive autonomic: fire upstream "food"/"drink" actions
+        // when the bot is idle (no queued intents, no wait active)
+        // at low cadence. The actions self-gate via isUseful() so
+        // calls when not-useful are cheap no-ops.
+        void TickReactiveAutonomic(Player* bot);
+
+        bool                                   tickedOnce_      = false;
+        bool                                   isWaiting_       = false;
         // steady_clock so we avoid getMSTime's uint32 wraparound.
-        bool                                   isWaiting_   = false;
         std::chrono::steady_clock::time_point  waitUntil_;
+        // Counter to throttle reactive autonomic checks. Increments
+        // each idle tick; reactives fire when it crosses the cadence
+        // threshold (kReactiveCadenceTicks below).
+        uint32_t                               idleTickCount_   = 0;
+        static constexpr uint32_t              kReactiveCadenceTicks = 50;
     };
 }
 
