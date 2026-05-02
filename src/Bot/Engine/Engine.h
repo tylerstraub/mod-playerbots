@@ -65,7 +65,13 @@ public:
     Engine(PlayerbotAI* botAI, AiObjectContext* factory);
 
     void Init();
-    void addStrategy(std::string const name, bool init = true);
+    // Sbywow note: virtual so SbywowAgentEngine can filter cognitive
+    // strategies that PlayerbotAI::ResetStrategies tries to add via
+    // AddDefaultNonCombatStrategies. Single-line Bucket 2 splice;
+    // cohesive override in src/Bot/Sbywow/AgentEngine. See
+    // docs/decisions.md "Architectural pivot" entry and
+    // docs/agent-engine-design.md.
+    virtual void addStrategy(std::string const name, bool init = true);
     void addStrategies(std::string first, ...);
     void addStrategiesNoInit(std::string first, ...);
     bool removeStrategy(std::string const name, bool init = true);

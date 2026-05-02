@@ -19,6 +19,8 @@
 #include "Playerbots.h"
 #include "PriestAiObjectContext.h"
 #include "RogueAiObjectContext.h"
+#include "Sbywow/AgentEngine/IsAgentBonded.h"
+#include "Sbywow/AgentEngine/SbywowAgentEngine.h"
 #include "ShamanAiObjectContext.h"
 #include "SharedDefines.h"
 #include "SpellInfo.h"
@@ -714,8 +716,19 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
 
 Engine* AiFactory::createNonCombatEngine(Player* player, PlayerbotAI* const facade, AiObjectContext* aiObjectContext)
 {
-    Engine* nonCombatEngine = new Engine(facade, aiObjectContext);
+    // Sbywow fork point — agent-bonded bots (mercs today; PBC-card-bonded
+    // bots later) get the SbywowAgentEngine instead of the upstream
+    // Engine for BOT_STATE_NON_COMBAT. Combat and dead engines remain
+    // default. See docs/decisions.md "Architectural pivot" entry and
+    // docs/agent-engine-design.md.
+    if (Sbywow::IsAgentBonded(player))
+    {
+        Engine* engine = new Sbywow::SbywowAgentEngine(facade, aiObjectContext);
+        engine->Init();
+        return engine;
+    }
 
+    Engine* nonCombatEngine = new Engine(facade, aiObjectContext);
     AddDefaultNonCombatStrategies(player, facade, nonCombatEngine);
     nonCombatEngine->Init();
     return nonCombatEngine;

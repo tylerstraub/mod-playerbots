@@ -2,6 +2,10 @@
 
 #include "BotSession.h"
 
+#include "../AgentEngine/IsAgentBonded.h"
+#include "../AgentEngine/SbywowAgentEngine.h"
+#include "../MercenaryMgr.h"
+
 #include "AiObjectContext.h"
 #include "Cell.h"
 #include "CellImpl.h"
@@ -238,6 +242,94 @@ namespace Sbywow::Bridge
             return states;
         }
 
+
+        // ---- Diagnostic / debug instrument ------------------------
+        //
+        // Surfaces everything we want visible during engine-replacement
+        // work: which engine subclass is installed in each state slot,
+        // bot session account-id vs cached service-account-id, master
+        // pointer state, current engine, last action. Adding this as a
+        // first-class verb (not a one-off log) so future engine work
+        // has a real instrument instead of LOG_INFO archaeology.
+        std::string DoInspect(Player* bot, BotSession& sess)
+        {
+            PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+
+            json botInfo = {
+                {"guid",               bot->GetGUID().GetRawValue()},
+                {"name",               bot->GetName()},
+                {"session_account_id", bot->GetSession() ? bot->GetSession()->GetAccountId() : 0},
+                {"level",              bot->GetLevel()},
+                {"class_id",           static_cast<int>(bot->getClass())},
+                {"race_id",            static_cast<int>(bot->getRace())},
+                {"map",                bot->GetMapId()},
+                {"zone",               bot->GetZoneId()},
+                {"area",               bot->GetAreaId()},
+                {"pos",                {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
+                {"in_combat",          bot->IsInCombat()},
+                {"alive",              bot->IsAlive()},
+                {"is_afk",             bot->isAFK()}
+            };
+
+            // Engine slot inspection — dynamic_cast detects whether
+            // our SbywowAgentEngine is installed. Adding new engine
+            // subclasses in the future: extend this dispatch.
+            auto engineClass = [](Engine* e) -> std::string
+            {
+                if (!e) return "<null>";
+                if (dynamic_cast<Sbywow::SbywowAgentEngine*>(e)) return "SbywowAgentEngine";
+                return "Engine";
+            };
+
+            json engineInfo;
+            if (ai)
+            {
+                Engine* combat    = ai->GetEngine(BOT_STATE_COMBAT);
+                Engine* nonCombat = ai->GetEngine(BOT_STATE_NON_COMBAT);
+                Engine* dead      = ai->GetEngine(BOT_STATE_DEAD);
+
+                engineInfo = {
+                    {"combat", {
+                        {"class",             engineClass(combat)},
+                        {"strategies_count",  combat    ? static_cast<int>(combat->GetStrategies().size())    : 0}
+                    }},
+                    {"non_combat", {
+                        {"class",             engineClass(nonCombat)},
+                        {"strategies_count",  nonCombat ? static_cast<int>(nonCombat->GetStrategies().size()) : 0}
+                    }},
+                    {"dead", {
+                        {"class",             engineClass(dead)},
+                        {"strategies_count",  dead      ? static_cast<int>(dead->GetStrategies().size())      : 0}
+                    }}
+                };
+
+                Player* master = ai->GetMaster();
+                botInfo["has_master"]  = (master != nullptr);
+                botInfo["master_name"] = master ? master->GetName() : "";
+                botInfo["master_guid"] = master ? master->GetGUID().GetRawValue() : 0ULL;
+            }
+
+            json sbywowInfo = {
+                {"is_agent_bonded",     Sbywow::IsAgentBonded(bot)},
+                {"service_account_id",  sMercenaryMgr.GetServiceAccountId()}
+            };
+
+            json sessionInfo = {
+                {"heartbeat_ms",  sess.HeartbeatAgeMs()},
+                {"afk",           sess.IsAfk()},
+                {"sse_attached",  sess.IsSseAttached()},
+                {"seized",        sess.IsSeized()}
+            };
+
+            return json{
+                {"ok",       true},
+                {"verb",     "inspect"},
+                {"bot",      botInfo},
+                {"engines",  engineInfo},
+                {"sbywow",   sbywowInfo},
+                {"session",  sessionInfo}
+            }.dump();
+        }
 
         // ---- Autonomous-driving primitives ------------------------
         //
@@ -837,6 +929,11 @@ namespace Sbywow::Bridge
                     out["error"] = "value type does not support Load() (read-only via set_value)";
                 return out.dump();
             }
+
+            // ---- Diagnostic ------------------------------------------
+
+            if (verb == "inspect")
+                return DoInspect(bot, sess);
 
             // ---- Autonomous-driving primitives ------------------------
 
