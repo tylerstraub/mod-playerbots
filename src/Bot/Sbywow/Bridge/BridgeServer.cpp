@@ -346,8 +346,21 @@ namespace Sbywow::Bridge
                 return;
             }
 
-            res.status = 200;
-            res.set_content(fut.get(), "application/json");
+            // wait_for returning ready can also mean broken_promise (the
+            // session/PendingCommand was destroyed before set_value ran,
+            // e.g. bot logged out mid-flight). get() throws future_error
+            // in that case; turn it into a clean 503 instead of letting
+            // it bubble up as an httplib 500.
+            try
+            {
+                res.status = 200;
+                res.set_content(fut.get(), "application/json");
+            }
+            catch (std::future_error const&)
+            {
+                res.status = 503;
+                res.set_content(R"({"ok":false,"error":"session went away mid-command"})", "application/json");
+            }
         });
 
         // GET /bot/<guid>/events  (SSE stream)
