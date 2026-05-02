@@ -18,25 +18,10 @@ class SbywowMercenaryPlayerScript : public PlayerScript
 {
 public:
     SbywowMercenaryPlayerScript() : PlayerScript("SbywowMercenaryPlayerScript", {
-        PLAYERHOOK_ON_LOGIN,
-        PLAYERHOOK_ON_LOGOUT,
         PLAYERHOOK_ON_LEVEL_CHANGED,
         PLAYERHOOK_ON_DELETE,
         PLAYERHOOK_ON_MAP_CHANGED
     }) {}
-
-    void OnPlayerLogin(Player* /*player*/) override
-    {
-        // The actual auto-summon on login happens inside the patched
-        // PlayerbotMgr::OnPlayerLogin (which queries our table); this hook is
-        // a placeholder for future sbywow-side login work.
-    }
-
-    void OnPlayerLogout(Player* /*player*/) override
-    {
-        // Login bots auto-despawn when their master logs out via the existing
-        // PlayerbotMgr cascade; we may add bookkeeping here later.
-    }
 
     void OnPlayerLevelChanged(Player* player, uint8 oldLevel) override
     {

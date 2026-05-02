@@ -76,7 +76,6 @@ public:
             {"list",       HandleListCommand,       SEC_PLAYER,     Console::No},
             {"dismiss",    HandleDismissCommand,    SEC_PLAYER,     Console::No},
             {"dismissall", HandleDismissAllCommand, SEC_PLAYER,     Console::No},
-            {"summon",    HandleSummonCommand,      SEC_GAMEMASTER, Console::No},
             {"resync",    HandleResyncCommand,      SEC_GAMEMASTER, Console::No},
             {"admin",     mercAdminTable},
         };
@@ -239,12 +238,6 @@ public:
             sMercenaryMgr.DismissMerc(mercGuid);
 
         handler->PSendSysMessage("Dismissed {} mercenary(s).", mercs.size());
-        return true;
-    }
-
-    static bool HandleSummonCommand(ChatHandler* handler, char const* /*args*/)
-    {
-        handler->SendSysMessage("merc summon: not implemented yet");
         return true;
     }
 

@@ -30,7 +30,6 @@ public:
     // Mutations driven by the .merc hire / dismiss flows.
     void AddOwnership(ObjectGuid mercGuid, ObjectGuid ownerGuid, uint8 classId);
     void RemoveOwnership(ObjectGuid mercGuid);
-    void RemoveAllOwnedBy(ObjectGuid ownerGuid);
 
     // Full dismiss: gracefully despawn if online (via owner's PlayerbotMgr),
     // remove from <Mercenaries> guild, delete character row, drop cache entry,

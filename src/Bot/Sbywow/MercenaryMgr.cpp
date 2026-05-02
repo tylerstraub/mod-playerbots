@@ -196,16 +196,13 @@ void MercenaryMgr::AddOwnership(ObjectGuid mercGuid, ObjectGuid ownerGuid, uint8
 
 void MercenaryMgr::RemoveOwnership(ObjectGuid mercGuid)
 {
-    CharacterDatabase.Execute(
+    // DirectExecute is synchronous — the row is gone before this returns. We
+    // need this guarantee for the reaper sweeps (sweep 2 immediately re-queries
+    // the table; if RemoveOwnership were async via Execute, sweep 2 would
+    // double-catch the same row before the worker thread committed).
+    CharacterDatabase.DirectExecute(
         "DELETE FROM mod_sbywow_mercenaries WHERE merc_guid = {}",
         mercGuid.GetCounter());
-}
-
-void MercenaryMgr::RemoveAllOwnedBy(ObjectGuid ownerGuid)
-{
-    CharacterDatabase.Execute(
-        "DELETE FROM mod_sbywow_mercenaries WHERE owner_guid = {}",
-        ownerGuid.GetCounter());
 }
 
 void MercenaryMgr::DismissMerc(ObjectGuid mercGuid)
@@ -227,7 +224,7 @@ void MercenaryMgr::DismissMerc(ObjectGuid mercGuid)
     // state, removes from group, tears down the WorldSession, and destroys the
     // Player object — so the subsequent Player::DeleteFromDB doesn't race
     // against a live Player*/session pair (which would crash on next ObjectAccessor sweep).
-    if (Player* mercPlayer = ObjectAccessor::FindConnectedPlayer(mercGuid))
+    if (ObjectAccessor::FindConnectedPlayer(mercGuid))
     {
         QueryResult ownerRow = CharacterDatabase.Query(
             "SELECT owner_guid FROM mod_sbywow_mercenaries WHERE merc_guid = {}",
@@ -239,16 +236,11 @@ void MercenaryMgr::DismissMerc(ObjectGuid mercGuid)
             if (Player* owner = ObjectAccessor::FindConnectedPlayer(ownerGuid))
             {
                 if (PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(owner))
-                {
                     mgr->LogoutPlayerBot(mercGuid);
-                    // mercPlayer is now invalid (deleted by LogoutPlayer cascade).
-                }
                 else
-                {
                     LOG_WARN("server.misc",
                         "Sbywow: merc '{}' (guid={}) online but owner has no PlayerbotMgr — proceeding with raw DeleteFromDB",
                         mercName, mercGuid.GetCounter());
-                }
             }
             else
             {
@@ -263,7 +255,6 @@ void MercenaryMgr::DismissMerc(ObjectGuid mercGuid)
                 "Sbywow: merc '{}' (guid={}) online but no ownership row — proceeding with raw DeleteFromDB",
                 mercName, mercGuid.GetCounter());
         }
-        (void)mercPlayer;  // suppress unused-after-this-line warning
     }
 
     if (_mercenariesGuildId)
@@ -324,6 +315,13 @@ void MercenaryMgr::ReapOrphans()
         LOG_INFO("server.loading",
             "Sbywow: orphan reaper sweep 1 (dead owner): {} merc(s) dismissed", reaped);
     }
+
+    // Drain async writes from sweep 1 (DismissMerc → RemoveOwnership uses
+    // CharacterDatabase.Execute, async). Without this drain, sweep 2's sync
+    // SELECT below would re-find the same rows and double-log them.
+    using namespace std::chrono_literals;
+    while (CharacterDatabase.QueueSize())
+        std::this_thread::sleep_for(50ms);
 
     // Sweep 2: ownership rows whose merc_guid no longer exists in characters.
     // The character was nuked out from under us (e.g. via .character delete on

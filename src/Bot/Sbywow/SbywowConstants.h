@@ -14,7 +14,6 @@ namespace Sbywow
     // Server-side guild that contains every mercenary character, owned by an
     // immortal service character that itself lives on the service account.
     constexpr char const* MERCENARIES_GUILD_NAME = "Mercenaries";
-    constexpr char const* GUILDMASTER_NAME       = "Guildmaster";
 
     // Per-owner mercenary cap. Sized to allow a full 5-man (owner + 4 mercs)
     // without filling every party slot, leaving room for one real player to
