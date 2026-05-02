@@ -45,6 +45,7 @@
 #include "RandomPlayerbotMgr.h"
 #include "SayAction.h"
 #include "ScriptMgr.h"
+#include "Sbywow/AgentEngine/IsAgentBonded.h"
 #include "ServerFacade.h"
 #include "SharedDefines.h"
 #include "SocialMgr.h"
@@ -1513,7 +1514,13 @@ void PlayerbotAI::DoNextAction(bool min)
         SetNextCheckDelay(sPlayerbotAIConfig.passiveDelay);
         return;
     }
-    else if (bot->isAFK())
+    // Sbywow: agent-bonded bots have their AFK marker managed
+    // explicitly by the bridge (set_agent_mode verb / .merc agent
+    // chat command). AFK is on whenever agent_mode is off (the
+    // default state on attach). The auto-clear here would race
+    // against that, so skip for them. See docs/decisions.md
+    // "Agent mode is an explicit opt-in."
+    else if (bot->isAFK() && !Sbywow::IsAgentBonded(bot))
         bot->ToggleAFK();
 
     if (master && master->IsInWorld())

@@ -172,7 +172,10 @@ namespace
             // without round-tripping through inspect or scrubbing
             // the SSE history.
             if (auto session = BridgeServer::Instance().GetSession(player->GetGUID()))
+            {
                 ev["intent_count"] = static_cast<int>(session->IntentCount());
+                ev["agent_mode"]   = session->IsAgentMode();
+            }
             if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(player))
             {
                 if (auto* agentEng = dynamic_cast<Sbywow::SbywowAgentEngine*>(

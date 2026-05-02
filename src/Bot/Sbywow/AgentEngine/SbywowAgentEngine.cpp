@@ -4,6 +4,7 @@
 #include "../Bridge/BotSession.h"
 #include "../Bridge/deps/json.hpp"
 
+#include "AiFactory.h"
 #include "Creature.h"
 #include "Event.h"
 #include "GossipDef.h"
@@ -36,6 +37,23 @@ namespace Sbywow
         // do_action for these explicitly when wanted. We can revisit
         // this in v1.x if it turns out to be friction.
         addStrategiesNoInit("default", nullptr);
+
+        // Build the internal default Engine. Mirrors the upstream
+        // AiFactory::createNonCombatEngine pattern (new Engine →
+        // AddDefaultNonCombatStrategies → Init) but on a separate
+        // instance we own. The default state is agent_mode=false so
+        // this is what ticks on every fresh attach until the agent
+        // harness opts in. Strategy stack is set once here and
+        // intentionally never modified afterward — agent-issued
+        // strategy ops affect us (and our filter), not the default
+        // engine, so its behavior is always "what a default merc
+        // does." See decisions.md "Agent mode is an explicit opt-in."
+        if (Player* bot = ai ? ai->GetBot() : nullptr)
+        {
+            defaultEngine_ = std::make_unique<Engine>(ai, context);
+            AiFactory::AddDefaultNonCombatStrategies(bot, ai, defaultEngine_.get());
+            defaultEngine_->Init();
+        }
     }
 
     void SbywowAgentEngine::addStrategy(std::string const name, bool init)
@@ -87,7 +105,7 @@ namespace Sbywow
         }
     }
 
-    bool SbywowAgentEngine::DoNextAction(Unit* /*target*/, uint32 /*depth*/, bool /*minimal*/)
+    bool SbywowAgentEngine::DoNextAction(Unit* target, uint32 depth, bool minimal)
     {
         if (!botAI)
             return false;
@@ -109,6 +127,22 @@ namespace Sbywow
         }
 
         auto session = Sbywow::Bridge::BridgeServer::Instance().GetSession(bot->GetGUID());
+
+        // Agent-mode routing. Default state is agent_mode=false,
+        // meaning the bot behaves like a normal default merc — we
+        // delegate the tick to the internal default Engine. The
+        // agent harness explicitly opts in via the `set_agent_mode`
+        // bridge verb (or master via `.merc agent`), and only then
+        // does the agent path below run. Our own queue and wait
+        // state are deliberately PRESERVED across both transitions,
+        // untouched, so the agent can resume mid-plan on toggle-on
+        // even after a silent window. See decisions.md "Agent mode
+        // is an explicit opt-in" for the design.
+        if (session && !session->IsAgentMode() && defaultEngine_)
+        {
+            ++defaultEngineTicksTotal_;
+            return defaultEngine_->DoNextAction(target, depth, minimal);
+        }
 
         // Wait suspension: while engaged, no intents drain. Wait is
         // explicit agent-issued sequencing — "do A, hold for N ms,
@@ -501,5 +535,10 @@ namespace Sbywow
             return 0;
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                    waitUntil_ - now).count();
+    }
+
+    size_t SbywowAgentEngine::DefaultEngineStrategiesCount() const
+    {
+        return defaultEngine_ ? defaultEngine_->GetStrategies().size() : 0;
     }
 }

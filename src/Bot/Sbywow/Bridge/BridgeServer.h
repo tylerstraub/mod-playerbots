@@ -85,6 +85,25 @@ namespace Sbywow::Bridge
         // resolved" (2026-05-02) for the format choice.
         uint64_t MintIntentId() { return nextIntentId_.fetch_add(1); }
 
+        // Centralized agent-mode toggle, called by both the
+        // `set_agent_mode` bridge verb (source="agent") and the
+        // `.merc agent` chat command (source="master"). Updates
+        // BotSession::SetAgentMode, side-effect-syncs the bot's WoW
+        // AFK marker + autoReplyMsg (AFK is on whenever
+        // agent_mode==false to give other players a visible cue),
+        // and emits a lifecycle SSE event so attached harnesses see
+        // the transition. Returns the *previous* mode so callers
+        // can render no-change feedback ("already in agent mode").
+        //
+        // Queue and wait state on the agent engine are deliberately
+        // NOT touched here — preservation across mode flips is the
+        // central design property. See decisions.md "Agent mode is
+        // an explicit opt-in."
+        //
+        // World-thread only (called from TickBot dispatch and from
+        // the chat command, both world-thread).
+        bool ApplyAgentModeToggle(Player* bot, bool desired, std::string const& source);
+
     private:
         BridgeServer() = default;
         ~BridgeServer();

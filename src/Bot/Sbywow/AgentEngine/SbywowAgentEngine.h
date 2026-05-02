@@ -33,6 +33,7 @@
 #include "Intent.h"
 
 #include <chrono>
+#include <memory>
 #include <string>
 
 class AiObjectContext;
@@ -90,6 +91,19 @@ namespace Sbywow
         uint64_t    IntentsDispatchedTotal()  const { return intentsDispatchedTotal_; }
         uint64_t    ReactivesFiredTotal()     const { return reactivesFiredTotal_; }
 
+        // Default-engine accessors. The default engine is the upstream
+        // mod-playerbots Engine instance built at construction with
+        // the full default non-combat strategy stack. We hold it
+        // permanently — strategy ops on us do NOT propagate to it, so
+        // its behavior is always "what a normal default merc does."
+        // When session->IsAgentMode() is FALSE (the default for fresh
+        // attaches), DoNextAction routes here; the agent's queue and
+        // wait state on us are preserved untouched so a mid-plan
+        // toggle-off-then-on resumes cleanly. See decisions.md
+        // "Agent mode is an explicit opt-in" for the design.
+        size_t      DefaultEngineStrategiesCount() const;
+        uint64_t    DefaultEngineTicksTotal()      const { return defaultEngineTicksTotal_; }
+
     private:
         std::string ExecuteMove    (Player* bot, Intent const& intent);
         std::string ExecuteInteract(Player* bot, Intent const& intent);
@@ -124,9 +138,20 @@ namespace Sbywow
         // Cumulative counters surfaced via inspect for "is the engine
         // ticking? are intents flowing?" sanity. World-thread only;
         // no atomics needed.
-        uint64_t                               ticksTotal_              = 0;
-        uint64_t                               intentsDispatchedTotal_  = 0;
-        uint64_t                               reactivesFiredTotal_     = 0;
+        uint64_t                               ticksTotal_                 = 0;
+        uint64_t                               intentsDispatchedTotal_     = 0;
+        uint64_t                               reactivesFiredTotal_        = 0;
+        uint64_t                               defaultEngineTicksTotal_    = 0;
+
+        // Default Engine — built in our constructor via the upstream
+        // AiFactory pattern, populated with the full default
+        // non-combat strategy stack, fully Init'd. Ticks while
+        // session->IsAgentMode() is false (the default for fresh
+        // attaches). unique_ptr cleans up on our destruction. Its
+        // strategy stack is intentionally immutable post-construction
+        // (agent-issued strategy ops on *us* do NOT propagate) so its
+        // behavior is predictable: "what a default merc does."
+        std::unique_ptr<Engine>                defaultEngine_;
     };
 }
 

@@ -1,3 +1,5 @@
+#include "BridgeServer.h"
+#include "BotSession.h"
 #include "CharacterCache.h"
 #include "Chat.h"
 #include "DatabaseEnv.h"
@@ -58,6 +60,19 @@ namespace
             default:                 return "Unknown";
         }
     }
+
+    // Parse optional on/off arg for the .merc agent command.
+    // Returns: 1 = "on"/"true"/"1", 0 = "off"/"false"/"0",
+    // -1 = invalid, 2 = empty (query mode).
+    int ParseOnOff(std::string s)
+    {
+        std::transform(s.begin(), s.end(), s.begin(),
+            [](unsigned char c) { return std::tolower(c); });
+        if (s.empty())                                return 2;
+        if (s == "on"  || s == "true"  || s == "1")   return 1;
+        if (s == "off" || s == "false" || s == "0")   return 0;
+        return -1;
+    }
 }
 
 class sbywow_merc_commandscript : public CommandScript
@@ -73,6 +88,7 @@ public:
             {"reap",    HandleAdminReapCommand,    SEC_GAMEMASTER,    Console::Yes},
             {"hire",    HandleAdminHireCommand,    SEC_ADMINISTRATOR, Console::Yes},
             {"nuke",    HandleAdminNukeCommand,    SEC_ADMINISTRATOR, Console::Yes},
+            {"agent",   HandleAdminAgentModeCommand, SEC_GAMEMASTER,  Console::Yes},
         };
 
         static ChatCommandTable mercTable = {
@@ -84,6 +100,7 @@ public:
             {"dismiss",    HandleDismissCommand,    SEC_PLAYER, Console::No},
             {"dismissall", HandleDismissAllCommand, SEC_PLAYER, Console::No},
             {"resync",     HandleResyncCommand,     SEC_PLAYER, Console::No},
+            {"agent",      HandleAgentModeCommand,  SEC_PLAYER, Console::No},
             {"admin",      mercAdminTable},
         };
 
@@ -467,6 +484,85 @@ public:
         return true;
     }
 
+    // .merc agent <name> [on|off] — toggle whether the LLM agent is
+    // actively driving this merc. No arg = query current state.
+    // Default on summon is `off` (the merc runs default behavior
+    // until the agent or you flip this on). Use `on` to hand control
+    // to the agent harness; `off` to take it back / run defaults.
+    //
+    // The agent's queued intents and any active wait suspension are
+    // preserved across both transitions — the merc resumes mid-task
+    // when toggled back on. See decisions.md "Agent mode is an
+    // explicit opt-in."
+    static bool HandleAgentModeCommand(ChatHandler* handler, char const* args)
+    {
+        Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        if (!player)
+            return false;
+
+        std::string arg = args ? args : "";
+        std::string name, onOff;
+        if (std::size_t space = arg.find(' '); space == std::string::npos)
+            name = arg;
+        else
+        {
+            name  = arg.substr(0, space);
+            onOff = arg.substr(space + 1);
+            while (!onOff.empty() && onOff.back() == ' ')
+                onOff.pop_back();
+        }
+
+        if (name.empty())
+        {
+            handler->SendSysMessage("Usage: .merc agent <name> [on|off]");
+            return true;
+        }
+
+        ObjectGuid mercGuid = sCharacterCache->GetCharacterGuidByName(name);
+        if (mercGuid.IsEmpty() || !sMercenaryMgr.IsOwnedBy(mercGuid, player->GetGUID()))
+        {
+            handler->PSendSysMessage("'{}' is not one of your mercenaries.", name);
+            return true;
+        }
+
+        Player* merc = ObjectAccessor::FindConnectedPlayer(mercGuid);
+        if (!merc)
+        {
+            handler->PSendSysMessage("'{}' is offline. Summon them first (.merc summon {}) — "
+                                     "agent mode requires an active bridge session.",
+                                     name, name);
+            return true;
+        }
+
+        int parsed = ParseOnOff(onOff);
+        if (parsed == -1)
+        {
+            handler->PSendSysMessage("Bad arg: '{}'. Use 'on' or 'off'.", onOff);
+            return true;
+        }
+
+        // Query mode — no arg, just report current state.
+        if (parsed == 2)
+        {
+            auto session = Sbywow::Bridge::BridgeServer::Instance().GetSession(mercGuid);
+            bool agentMode = session && session->IsAgentMode();
+            handler->PSendSysMessage("'{}' agent mode: {}.", name, agentMode ? "on (LLM driving)" : "off (default merc)");
+            return true;
+        }
+
+        bool desired = (parsed == 1);
+        bool prev = Sbywow::Bridge::BridgeServer::Instance().ApplyAgentModeToggle(merc, desired, "master");
+        if (prev == desired)
+            handler->PSendSysMessage("'{}' agent mode was already {} (no change).",
+                                     name, desired ? "on" : "off");
+        else
+            handler->PSendSysMessage("'{}' agent mode: {} → {}.",
+                                     name,
+                                     prev    ? "on" : "off",
+                                     desired ? "on" : "off");
+        return true;
+    }
+
     static bool HandleAdminSetupCommand(ChatHandler* handler, char const* /*args*/)
     {
         handler->SendSysMessage("Sbywow: running EnsureServiceState (idempotent)...");
@@ -608,6 +704,72 @@ public:
 
         handler->PSendSysMessage("Nuked character guid={} (name='{}'). Cascade complete.",
             lowGuid, name);
+        return true;
+    }
+
+    // .merc admin agent <name> [on|off] — same as .merc agent but
+    // without the ownership check, for GMs assisting any player.
+    // SOAP-accessible (Console::Yes) so the agent harness operator
+    // can toggle remotely if needed.
+    static bool HandleAdminAgentModeCommand(ChatHandler* handler, char const* args)
+    {
+        std::string arg = args ? args : "";
+        std::string name, onOff;
+        if (std::size_t space = arg.find(' '); space == std::string::npos)
+            name = arg;
+        else
+        {
+            name  = arg.substr(0, space);
+            onOff = arg.substr(space + 1);
+            while (!onOff.empty() && onOff.back() == ' ')
+                onOff.pop_back();
+        }
+
+        if (name.empty())
+        {
+            handler->SendSysMessage("Usage: .merc admin agent <name> [on|off]");
+            return true;
+        }
+
+        ObjectGuid mercGuid = sCharacterCache->GetCharacterGuidByName(name);
+        if (mercGuid.IsEmpty())
+        {
+            handler->PSendSysMessage("No character found with name '{}'.", name);
+            return true;
+        }
+
+        Player* merc = ObjectAccessor::FindConnectedPlayer(mercGuid);
+        if (!merc)
+        {
+            handler->PSendSysMessage("'{}' is offline.", name);
+            return true;
+        }
+
+        int parsed = ParseOnOff(onOff);
+        if (parsed == -1)
+        {
+            handler->PSendSysMessage("Bad arg: '{}'. Use 'on' or 'off'.", onOff);
+            return true;
+        }
+
+        if (parsed == 2)
+        {
+            auto session = Sbywow::Bridge::BridgeServer::Instance().GetSession(mercGuid);
+            bool agentMode = session && session->IsAgentMode();
+            handler->PSendSysMessage("'{}' agent mode: {}.", name, agentMode ? "on (LLM driving)" : "off (default merc)");
+            return true;
+        }
+
+        bool desired = (parsed == 1);
+        bool prev = Sbywow::Bridge::BridgeServer::Instance().ApplyAgentModeToggle(merc, desired, "master");
+        if (prev == desired)
+            handler->PSendSysMessage("'{}' agent mode was already {} (no change).",
+                                     name, desired ? "on" : "off");
+        else
+            handler->PSendSysMessage("'{}' agent mode: {} → {}.",
+                                     name,
+                                     prev    ? "on" : "off",
+                                     desired ? "on" : "off");
         return true;
     }
 };

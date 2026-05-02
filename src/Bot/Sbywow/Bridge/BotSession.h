@@ -123,12 +123,33 @@ namespace Sbywow::Bridge
         bool                     WaitOutbound(OutboundEvent& out, int timeoutMs);
 
         // Heartbeat / liveness. POST /cmd and explicit ping verb both
-        // call MarkAlive. World-thread tick reads HeartbeatAgeMs to drive
-        // the AFK degradation flag.
+        // call MarkAlive. HeartbeatAgeMs is purely informational now —
+        // surfaced via inspect.session.heartbeat_ms — and no longer
+        // drives any automatic state transition. See decisions.md
+        // "Agent mode is an explicit opt-in" for rationale.
         void   MarkAlive();
         int    HeartbeatAgeMs() const;
-        bool   IsAfk() const { return isAfk_.load(); }
-        void   SetAfk(bool v) { isAfk_.store(v); }
+
+        // Agent mode. Explicitly opt-in: a freshly-attached bot
+        // defaults to agent_mode=false, which means the bot behaves
+        // like a normal default merc (SbywowAgentEngine routes ticks
+        // to its internal default Engine instance). The agent harness
+        // opts in via the `set_agent_mode` bridge verb, or the master
+        // can flip it via `.merc agent <name> [on|off]`. When true,
+        // the bot's BOT_STATE_NON_COMBAT is owned by the agent's
+        // intent queue.
+        //
+        // Never toggled implicitly — heartbeat lapse, network blips,
+        // detach all leave it alone. Reconnects start fresh
+        // (default=false), so there's no zombie "agent control"
+        // state lingering across summon/dismiss cycles.
+        //
+        // Queue and wait state on the engine ARE preserved across
+        // both transitions so the agent can resume mid-plan on
+        // toggle-back. See decisions.md "Agent mode is an explicit
+        // opt-in" for the full rationale.
+        bool   IsAgentMode() const { return agentMode_.load(); }
+        void   SetAgentMode(bool v) { agentMode_.store(v); }
 
         // SSE attachment tracking — set when /events handler enters its
         // streaming loop, cleared when the connection drops. The
@@ -159,7 +180,7 @@ namespace Sbywow::Bridge
         std::deque<OutboundEvent>                   outbound_;
 
         std::atomic<int64_t>                        lastAliveMs_{0};
-        std::atomic<bool>                           isAfk_{false};
+        std::atomic<bool>                           agentMode_{false};
         std::atomic<bool>                           sseAttached_{false};
     };
 }

@@ -147,16 +147,31 @@ namespace Sbywow::Bridge
         if (!bot || !running_.load())
             return false;
 
-        std::lock_guard<std::mutex> lock(sessionsMutex_);
-        uint64 key = bot->GetGUID().GetRawValue();
-        if (sessions_.find(key) != sessions_.end())
-            return false;
+        {
+            std::lock_guard<std::mutex> lock(sessionsMutex_);
+            uint64 key = bot->GetGUID().GetRawValue();
+            if (sessions_.find(key) != sessions_.end())
+                return false;
 
-        auto session = std::make_shared<BotSession>(bot->GetGUID());
-        session->SetName(bot->GetName());
-        sessions_[key] = session;
-        LOG_INFO("server.loading", "[SbywowBridge] attached bot guid={} name={}",
-                 key, bot->GetName());
+            auto session = std::make_shared<BotSession>(bot->GetGUID());
+            session->SetName(bot->GetName());
+            sessions_[key] = session;
+            LOG_INFO("server.loading", "[SbywowBridge] attached bot guid={} name={}",
+                     key, bot->GetName());
+        }
+
+        // Default state on attach: agent_mode=false. The bot's WoW
+        // AFK marker reflects "agent not driving" so other players
+        // see [AFK] from the moment the merc spawns until the agent
+        // harness opts in via set_agent_mode true. The session flag
+        // already defaults to false; just set the visible side-
+        // effect (toggle / autoReplyMsg) — there's no transition
+        // event since this is the initial state, not a change.
+        if (!bot->isAFK())
+        {
+            bot->ToggleAFK();
+            bot->autoReplyMsg = "Agent not actively driving — running default merc behavior";
+        }
         return true;
     }
 
@@ -180,6 +195,57 @@ namespace Sbywow::Bridge
         if (it == sessions_.end())
             return nullptr;
         return it->second;
+    }
+
+    bool BridgeServer::ApplyAgentModeToggle(Player* bot, bool desired, std::string const& source)
+    {
+        if (!bot)
+            return false;
+        auto session = GetSession(bot->GetGUID());
+        if (!session)
+            return false;
+
+        bool prev = session->IsAgentMode();
+        if (prev == desired)
+            return prev;  // no-change short-circuit
+
+        session->SetAgentMode(desired);
+
+        // Mirror to the WoW AFK marker for player-visibility. Other
+        // players see [AFK] on the bot when agent_mode is false (the
+        // default state on attach), so they know the agent isn't
+        // driving even if the bot is otherwise active under default
+        // behavior. autoReplyMsg conveys the custom semantic to
+        // anyone whispering. AFK on agent-bonded bots is owned
+        // exclusively by us — see PlayerbotAI.cpp / AcceptInvitation
+        // gates against IsAgentBonded.
+        if (!desired && !bot->isAFK())
+        {
+            bot->ToggleAFK();
+            bot->autoReplyMsg = "Agent not actively driving — running default merc behavior";
+        }
+        else if (desired && bot->isAFK())
+        {
+            bot->ToggleAFK();
+            bot->autoReplyMsg = "";
+        }
+
+        // Lifecycle SSE: harness consumers can correlate transitions
+        // and surface them to the master/operator.
+        json ev = {
+            {"channel",    "lifecycle"},
+            {"kind",       desired ? "agent_mode_entered" : "agent_mode_exited"},
+            {"bot_guid",   bot->GetGUID().GetRawValue()},
+            {"bot_name",   bot->GetName()},
+            {"source",     source},
+            {"agent_mode", desired}
+        };
+        session->PushOutbound(ev.dump());
+
+        LOG_INFO("playerbots",
+                 "[SbywowBridge] agent_mode toggle: bot={} mode={} source={}",
+                 bot->GetName().c_str(), desired ? "on" : "off", source.c_str());
+        return prev;
     }
 
     // -----------------------------------------------------------------------
@@ -298,15 +364,18 @@ namespace Sbywow::Bridge
                 if (auto* agentEng = dynamic_cast<Sbywow::SbywowAgentEngine*>(nonCombat))
                 {
                     agentEngineState = {
-                        {"is_waiting",               agentEng->IsWaiting()},
-                        {"waiting_intent_id",        agentEng->WaitingIntentId() != 0
-                                                     ? json(std::to_string(agentEng->WaitingIntentId()))
-                                                     : json(nullptr)},
-                        {"waiting_intent_verb",      agentEng->WaitingIntentVerb()},
-                        {"waiting_remaining_ms",     agentEng->WaitingRemainingMs()},
-                        {"ticks_total",              agentEng->TicksTotal()},
-                        {"intents_dispatched_total", agentEng->IntentsDispatchedTotal()},
-                        {"reactives_fired_total",    agentEng->ReactivesFiredTotal()}
+                        {"agent_mode",                       sess.IsAgentMode()},
+                        {"default_engine_strategies_count",  static_cast<int>(agentEng->DefaultEngineStrategiesCount())},
+                        {"default_engine_ticks_total",       agentEng->DefaultEngineTicksTotal()},
+                        {"is_waiting",                       agentEng->IsWaiting()},
+                        {"waiting_intent_id",                agentEng->WaitingIntentId() != 0
+                                                             ? json(std::to_string(agentEng->WaitingIntentId()))
+                                                             : json(nullptr)},
+                        {"waiting_intent_verb",              agentEng->WaitingIntentVerb()},
+                        {"waiting_remaining_ms",             agentEng->WaitingRemainingMs()},
+                        {"ticks_total",                      agentEng->TicksTotal()},
+                        {"intents_dispatched_total",         agentEng->IntentsDispatchedTotal()},
+                        {"reactives_fired_total",            agentEng->ReactivesFiredTotal()}
                     };
                 }
 
@@ -323,7 +392,7 @@ namespace Sbywow::Bridge
 
             json sessionInfo = {
                 {"heartbeat_ms",   sess.HeartbeatAgeMs()},
-                {"afk",            sess.IsAfk()},
+                {"agent_mode",     sess.IsAgentMode()},
                 {"sse_attached",   sess.IsSseAttached()},
                 {"intent_count",   static_cast<int>(sess.IntentCount())}
             };
@@ -859,6 +928,31 @@ namespace Sbywow::Bridge
             if (verb == "inspect")
                 return DoInspect(bot, sess);
 
+            // set_agent_mode toggles whether the agent harness is
+            // actively driving the bot. Default on attach: false
+            // (default Engine ticks; bot acts like a normal merc).
+            // Agent opts in by setting true. Body:
+            // {"verb":"set_agent_mode","mode":true|false}. Returns
+            // {ok, agent_mode, previous_mode, changed}. See
+            // decisions.md "Agent mode is an explicit opt-in" for
+            // the design; .merc agent chat command is the master-
+            // side counterpart.
+            if (verb == "set_agent_mode")
+            {
+                if (!req.contains("mode") || !req["mode"].is_boolean())
+                    return json{{"ok", false},
+                                {"error", "set_agent_mode requires boolean 'mode'"}}.dump();
+                bool desired = req["mode"].get<bool>();
+                bool prev = BridgeServer::Instance().ApplyAgentModeToggle(bot, desired, "agent");
+                return json{
+                    {"ok",            true},
+                    {"verb",          "set_agent_mode"},
+                    {"agent_mode",    desired},
+                    {"previous_mode", prev},
+                    {"changed",       prev != desired}
+                }.dump();
+            }
+
             // ---- Autonomous-driving primitives ------------------------
 
             if (verb == "move_to")
@@ -1014,7 +1108,7 @@ namespace Sbywow::Bridge
     }
 
     // -----------------------------------------------------------------------
-    // World-thread tick: drain inbound, drive AFK
+    // World-thread tick: drain inbound commands
     // -----------------------------------------------------------------------
 
     void BridgeServer::TickBot(Player* bot)
@@ -1030,31 +1124,19 @@ namespace Sbywow::Bridge
         // the HTTP handler is blocked on. Intent verbs return their
         // ack immediately ({ok, intent_id, queued:true}); engine
         // completion is delivered out-of-band via SSE.
+        //
+        // Agent mode (whether the agent is driving vs. default Engine
+        // ticks) is an explicit opt-in managed by `set_agent_mode`
+        // (bridge verb) or `.merc agent` (chat command). Default on
+        // attach is OFF — see decisions.md "Agent mode is an explicit
+        // opt-in." HeartbeatAgeMs is informational only, not coupled
+        // to mode.
         std::shared_ptr<PendingCommand> cmd;
         while (session->PopInbound(cmd))
         {
             std::string out = DispatchCommand(bot, *session, cmd);
             try { cmd->result.set_value(std::move(out)); }
             catch (std::future_error const&) { /* receiver gone */ }
-        }
-
-        // AFK degradation. Heartbeat-driven: stale heartbeat sets the
-        // /afk marker so other party members can see the agent isn't
-        // home; restored heartbeat clears it.
-        bool stale = session->HeartbeatAgeMs() > config_.heartbeatTimeoutMs;
-        bool wasAfk = session->IsAfk();
-        if (stale && !wasAfk)
-        {
-            session->SetAfk(true);
-            bot->ToggleAFK();
-            bot->autoReplyMsg = "Agent unresponsive — autonomic only";
-        }
-        else if (!stale && wasAfk)
-        {
-            session->SetAfk(false);
-            if (bot->isAFK())
-                bot->ToggleAFK();
-            bot->autoReplyMsg = "";
         }
     }
 
@@ -1196,7 +1278,7 @@ namespace Sbywow::Bridge
                         {"guid",            key},
                         {"name",            sess->Name()},
                         {"heartbeat_ms",    sess->HeartbeatAgeMs()},
-                        {"afk",             sess->IsAfk()},
+                        {"agent_mode",      sess->IsAgentMode()},
                         {"sse_attached",    sess->IsSseAttached()},
                         {"intent_count",    static_cast<int>(sess->IntentCount())}
                     });

@@ -10,6 +10,7 @@
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotSecurity.h"
 #include "Playerbots.h"
+#include "Sbywow/AgentEngine/IsAgentBonded.h"
 #include "WorldPacket.h"
 
 bool AcceptInvitationAction::Execute(Event event)
@@ -35,7 +36,11 @@ bool AcceptInvitationAction::Execute(Event event)
         return false;
     }
 
-    if (bot->isAFK())
+    // Sbywow: agent-bonded bots have their AFK marker managed
+    // explicitly by the bridge. Skip the auto-clear here so a stray
+    // group invite while agent_mode is off doesn't strip the
+    // visual "agent not driving" cue.
+    if (bot->isAFK() && !Sbywow::IsAgentBonded(bot))
         bot->ToggleAFK();
 
     WorldPacket p;
