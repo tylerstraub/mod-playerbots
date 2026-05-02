@@ -1,11 +1,18 @@
 #include "MercenaryMgr.h"
 
+#include "CharacterCache.h"
+#include "Log.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "PlayerbotFactory.h"
+#include "PlayerbotMgr.h"
+#include "Playerbots.h"  // GET_PLAYERBOT_MGR
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "WorldSession.h"
+
+#include <string>
 
 class SbywowMercenaryPlayerScript : public PlayerScript
 {
@@ -14,7 +21,8 @@ public:
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_LOGOUT,
         PLAYERHOOK_ON_LEVEL_CHANGED,
-        PLAYERHOOK_ON_DELETE
+        PLAYERHOOK_ON_DELETE,
+        PLAYERHOOK_ON_MAP_CHANGED
     }) {}
 
     void OnPlayerLogin(Player* /*player*/) override
@@ -51,6 +59,85 @@ public:
             if (merc->GetLevel() != newLevel)
                 merc->GiveLevel(newLevel);
             PlayerbotFactory(merc, newLevel, ITEM_QUALITY_EPIC).Randomize(true);
+        }
+    }
+
+    // Unified merc world-boundary handler. Fires after the owner's TeleportTo
+    // completes (cross-zone, continent, instance entry/exit, BG/Arena entry/exit).
+    //
+    // Decision tree per owned merc:
+    //   - Owner now in BG/Arena → despawn online mercs (no PvP-bracket cheese).
+    //   - Owner now elsewhere   → re-summon offline mercs (post-BG re-entry,
+    //                              or post-instance return) and teleport
+    //                              online mercs to owner's new map.
+    //
+    // Same-map intra-zone movement is a no-op (merc->GetMapId() == map id).
+    void OnPlayerMapChanged(Player* player) override
+    {
+        if (!player || !player->GetSession() || player->GetSession()->IsBot())
+            return;
+
+        std::vector<ObjectGuid> mercs = sMercenaryMgr.GetMercsForOwner(player->GetGUID());
+        if (mercs.empty())
+            return;
+
+        Map* destMap = player->GetMap();
+        if (!destMap)
+            return;
+
+        PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
+        if (!mgr)
+            return;  // Owner has no PlayerbotMgr — nothing we can do here.
+
+        bool const isPvP = destMap->IsBattlegroundOrArena();
+
+        for (ObjectGuid mercGuid : mercs)
+        {
+            Player* merc = ObjectAccessor::FindConnectedPlayer(mercGuid);
+
+            if (isPvP)
+            {
+                // Despawn online mercs entering PvP. Arena's BGJoinAction
+                // teleports group members in for free; this hook tears them
+                // back out. BGs typically don't TP group members but we
+                // despawn anyway for consistency (no merc presence during PvP).
+                if (merc)
+                {
+                    LOG_INFO("server.misc",
+                        "Sbywow: owner '{}' entered PvP map {} — despawning merc '{}'",
+                        player->GetName(), destMap->GetId(), merc->GetName());
+                    mgr->LogoutPlayerBot(mercGuid);
+                }
+                continue;
+            }
+
+            if (!merc)
+            {
+                // Merc not in world — re-summon. Two common causes:
+                //   (a) Owner just exited BG/Arena, mercs were despawned on entry.
+                //   (b) Hire happened while owner was in PvP / autologin missed.
+                std::string name;
+                sCharacterCache->GetCharacterNameByGuid(mercGuid, name);
+                if (name.empty())
+                    continue;
+                std::string cmd = "add " + name;
+                mgr->HandlePlayerbotCommand(cmd.c_str(), player);
+                continue;
+            }
+
+            // Merc online: teleport if on a different map. (Same-map intra-zone
+            // movement is handled by FollowAction; we don't want to spam-TP.)
+            if (merc->GetMapId() != player->GetMapId())
+            {
+                LOG_INFO("server.misc",
+                    "Sbywow: teleporting merc '{}' from map {} to owner '{}' on map {}",
+                    merc->GetName(), merc->GetMapId(), player->GetName(), player->GetMapId());
+                merc->TeleportTo(player->GetMapId(),
+                                 player->GetPositionX(),
+                                 player->GetPositionY(),
+                                 player->GetPositionZ(),
+                                 player->GetOrientation());
+            }
         }
     }
 
