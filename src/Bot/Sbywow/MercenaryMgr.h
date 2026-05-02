@@ -32,9 +32,14 @@ public:
     void RemoveOwnership(ObjectGuid mercGuid);
     void RemoveAllOwnedBy(ObjectGuid ownerGuid);
 
-    // Full dismiss: remove from <Mercenaries> guild, delete character row,
-    // drop cache entry, drain queue, remove ownership row.
+    // Full dismiss: gracefully despawn if online (via owner's PlayerbotMgr),
+    // remove from <Mercenaries> guild, delete character row, drop cache entry,
+    // drain queue, remove ownership row.
     void DismissMerc(ObjectGuid mercGuid);
+
+    // Boot-time self-heal: reap orphan rows + log dangling service-account
+    // characters. See implementation for the three sweeps.
+    void ReapOrphans();
 
     // Cached after EnsureServiceState. Zero/empty until bootstrap completes.
     uint32     GetServiceAccountId()   const { return _serviceAccountId; }

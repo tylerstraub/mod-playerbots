@@ -7,7 +7,10 @@
 #include "Guild.h"
 #include "GuildMgr.h"
 #include "Log.h"
+#include "ObjectAccessor.h"
 #include "Player.h"
+#include "PlayerbotMgr.h"
+#include "Playerbots.h"  // GET_PLAYERBOT_MGR
 #include "QueryResult.h"
 #include "RandomPlayerbotFactory.h"
 #include "SbywowConstants.h"
@@ -17,6 +20,7 @@
 #include <chrono>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 void MercenaryMgr::EnsureServiceState()
 {
@@ -218,6 +222,50 @@ void MercenaryMgr::DismissMerc(ObjectGuid mercGuid)
     std::string mercName;
     sCharacterCache->GetCharacterNameByGuid(mercGuid, mercName);
 
+    // If the merc is currently auto-summoned (in-world as a login-bot), route
+    // through the owner's PlayerbotMgr::LogoutPlayerBot first. That path saves
+    // state, removes from group, tears down the WorldSession, and destroys the
+    // Player object — so the subsequent Player::DeleteFromDB doesn't race
+    // against a live Player*/session pair (which would crash on next ObjectAccessor sweep).
+    if (Player* mercPlayer = ObjectAccessor::FindConnectedPlayer(mercGuid))
+    {
+        QueryResult ownerRow = CharacterDatabase.Query(
+            "SELECT owner_guid FROM mod_sbywow_mercenaries WHERE merc_guid = {}",
+            mercGuid.GetCounter());
+        if (ownerRow)
+        {
+            ObjectGuid ownerGuid = ObjectGuid::Create<HighGuid::Player>(
+                ownerRow->Fetch()[0].Get<uint32>());
+            if (Player* owner = ObjectAccessor::FindConnectedPlayer(ownerGuid))
+            {
+                if (PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(owner))
+                {
+                    mgr->LogoutPlayerBot(mercGuid);
+                    // mercPlayer is now invalid (deleted by LogoutPlayer cascade).
+                }
+                else
+                {
+                    LOG_WARN("server.misc",
+                        "Sbywow: merc '{}' (guid={}) online but owner has no PlayerbotMgr — proceeding with raw DeleteFromDB",
+                        mercName, mercGuid.GetCounter());
+                }
+            }
+            else
+            {
+                LOG_WARN("server.misc",
+                    "Sbywow: merc '{}' (guid={}) online but owner (guid={}) not connected — proceeding with raw DeleteFromDB",
+                    mercName, mercGuid.GetCounter(), ownerGuid.GetCounter());
+            }
+        }
+        else
+        {
+            LOG_WARN("server.misc",
+                "Sbywow: merc '{}' (guid={}) online but no ownership row — proceeding with raw DeleteFromDB",
+                mercName, mercGuid.GetCounter());
+        }
+        (void)mercPlayer;  // suppress unused-after-this-line warning
+    }
+
     if (_mercenariesGuildId)
     {
         if (Guild* guild = sGuildMgr->GetGuildById(_mercenariesGuildId))
@@ -234,4 +282,104 @@ void MercenaryMgr::DismissMerc(ObjectGuid mercGuid)
 
     LOG_INFO("server.misc",
         "Sbywow: dismissed merc '{}' (guid={})", mercName, mercGuid.GetCounter());
+}
+
+void MercenaryMgr::ReapOrphans()
+{
+    if (_serviceAccountId == 0)
+    {
+        LOG_WARN("server.loading",
+            "Sbywow: ReapOrphans skipped — service account not bootstrapped");
+        return;
+    }
+
+    // Sweep 1: ownership rows whose owner_guid no longer exists in characters.
+    // The owner was deleted at some point without our OnPlayerDelete cascade
+    // running (legacy data from pre-fix runs, or manual SQL deletes). Full
+    // dismiss the merc — char row, guild membership, and ownership row.
+    {
+        QueryResult res = CharacterDatabase.Query(
+            "SELECT m.merc_guid FROM mod_sbywow_mercenaries m "
+            "LEFT JOIN characters c ON c.guid = m.owner_guid "
+            "WHERE c.guid IS NULL");
+        uint32 reaped = 0;
+        if (res)
+        {
+            std::vector<ObjectGuid> victims;
+            do
+            {
+                victims.push_back(ObjectGuid::Create<HighGuid::Player>(
+                    res->Fetch()[0].Get<uint32>()));
+            } while (res->NextRow());
+
+            for (ObjectGuid mercGuid : victims)
+            {
+                LOG_INFO("server.loading",
+                    "Sbywow: reaping orphan merc (dead owner) guid={}",
+                    mercGuid.GetCounter());
+                DismissMerc(mercGuid);
+                ++reaped;
+            }
+        }
+        LOG_INFO("server.loading",
+            "Sbywow: orphan reaper sweep 1 (dead owner): {} merc(s) dismissed", reaped);
+    }
+
+    // Sweep 2: ownership rows whose merc_guid no longer exists in characters.
+    // The character was nuked out from under us (e.g. via .character delete on
+    // the service account, or a partial-failed CreateMerc). Just drop the row.
+    {
+        QueryResult res = CharacterDatabase.Query(
+            "SELECT m.merc_guid FROM mod_sbywow_mercenaries m "
+            "LEFT JOIN characters c ON c.guid = m.merc_guid "
+            "WHERE c.guid IS NULL");
+        uint32 reaped = 0;
+        if (res)
+        {
+            do
+            {
+                uint32 lowGuid = res->Fetch()[0].Get<uint32>();
+                ObjectGuid mercGuid = ObjectGuid::Create<HighGuid::Player>(lowGuid);
+                LOG_INFO("server.loading",
+                    "Sbywow: dropping ownership row for missing merc guid={}",
+                    lowGuid);
+                RemoveOwnership(mercGuid);
+                ++reaped;
+            } while (res->NextRow());
+        }
+        LOG_INFO("server.loading",
+            "Sbywow: orphan reaper sweep 2 (missing merc char): {} row(s) dropped", reaped);
+    }
+
+    // Sweep 3: warn-only. Service-account characters that aren't tracked in
+    // mod_sbywow_mercenaries and aren't the Guildmaster. Could be in-flight
+    // hires that crashed mid-CreateMerc, manual GM-created chars, or stale
+    // test fixtures. We do NOT auto-delete — character deletion is an explicit
+    // action that should pass through .merc admin nuke after human review.
+    {
+        uint32 gmLow = _guildmasterGuid.GetCounter();
+        QueryResult res = CharacterDatabase.Query(
+            "SELECT c.guid, c.name FROM characters c "
+            "LEFT JOIN mod_sbywow_mercenaries m ON m.merc_guid = c.guid "
+            "WHERE c.account = {} AND m.merc_guid IS NULL AND c.guid != {}",
+            _serviceAccountId, gmLow);
+        uint32 dangling = 0;
+        if (res)
+        {
+            do
+            {
+                Field* fields = res->Fetch();
+                LOG_WARN("server.loading",
+                    "Sbywow: untracked service-account character: guid={} name='{}' — review manually (.merc admin nuke <guid> if intended)",
+                    fields[0].Get<uint32>(), fields[1].Get<std::string>());
+                ++dangling;
+            } while (res->NextRow());
+        }
+        if (dangling > 0)
+            LOG_WARN("server.loading",
+                "Sbywow: orphan reaper sweep 3 (untracked service chars): {} found — see warnings above", dangling);
+        else
+            LOG_INFO("server.loading",
+                "Sbywow: orphan reaper sweep 3 (untracked service chars): clean");
+    }
 }

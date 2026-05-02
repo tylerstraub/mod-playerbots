@@ -54,9 +54,20 @@ public:
         }
     }
 
-    void OnPlayerDelete(ObjectGuid /*guid*/, uint32 /*accountId*/) override
+    void OnPlayerDelete(ObjectGuid guid, uint32 /*accountId*/) override
     {
-        // Cascade: dismiss every merc whose owner_guid matches the deleted char.
+        // Fires BEFORE Player::DeleteFromDB runs, so it's safe to enumerate
+        // owned mercs and dismiss them — DismissMerc cascades each merc through
+        // its own DeleteFromDB on the service account.
+        std::vector<ObjectGuid> owned = sMercenaryMgr.GetMercsForOwner(guid);
+        for (ObjectGuid mercGuid : owned)
+            sMercenaryMgr.DismissMerc(mercGuid);
+
+        // Also handle the inverse: if a service-account merc character is
+        // deleted directly (GM .character delete or our .merc admin nuke), drop
+        // its ownership row. RemoveOwnership is idempotent and a no-op for
+        // non-merc guids, so we can call unconditionally.
+        sMercenaryMgr.RemoveOwnership(guid);
     }
 };
 
@@ -71,6 +82,9 @@ public:
     {
         // World is fully loaded and DBs are ready — safe to bootstrap state.
         sMercenaryMgr.EnsureServiceState();
+        // Self-heal: prune any orphan rows accumulated from prior runs (broken
+        // OnPlayerDelete hook, manual SQL, partial CreateMerc failures).
+        sMercenaryMgr.ReapOrphans();
     }
 };
 
