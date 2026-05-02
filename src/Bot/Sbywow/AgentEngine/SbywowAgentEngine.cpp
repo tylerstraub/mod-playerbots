@@ -123,10 +123,18 @@ namespace Sbywow
             // there instead, so we're safe to claim "completed" here.
             if (session && waitingIntentId_ != 0)
             {
+                json result = json{{"ok", true}, {"verb", "wait"}};
                 json ev = BuildIntentEvent(bot, "intent_completed",
                                            waitingIntentId_, waitingIntentVerb_);
-                ev["result"] = json{{"ok", true}, {"verb", "wait"}};
+                ev["result"] = result;
                 session->PushOutbound(ev.dump());
+
+                Sbywow::Bridge::BotSession::TerminalIntent rec;
+                rec.intentId   = waitingIntentId_;
+                rec.verb       = waitingIntentVerb_;
+                rec.kind       = "intent_completed";
+                rec.resultJson = result.dump();
+                session->RecordTerminal(std::move(rec));
             }
             waitingIntentId_ = 0;
             waitingIntentVerb_.clear();
@@ -188,10 +196,17 @@ namespace Sbywow
         catch (std::exception const&) { result = {{"ok", false}, {"error", "engine returned non-JSON"}}; }
         bool ok = result.value("ok", false);
 
-        json ev = BuildIntentEvent(bot, ok ? "intent_completed" : "intent_failed",
-                                   pending->intentId, pending->verb);
+        std::string kind = ok ? "intent_completed" : "intent_failed";
+        json ev = BuildIntentEvent(bot, kind, pending->intentId, pending->verb);
         ev["result"] = result;
         session->PushOutbound(ev.dump());
+
+        Sbywow::Bridge::BotSession::TerminalIntent rec;
+        rec.intentId   = pending->intentId;
+        rec.verb       = pending->verb;
+        rec.kind       = std::move(kind);
+        rec.resultJson = result.dump();
+        session->RecordTerminal(std::move(rec));
 
         return true;
     }

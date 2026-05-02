@@ -57,14 +57,39 @@ namespace Sbywow::Bridge
         return intents_.size();
     }
 
-    bool BotSession::RemoveIntentById(uint64_t intentId)
+    bool BotSession::RemoveIntentById(uint64_t intentId, std::string& outVerb)
     {
         std::lock_guard<std::mutex> lock(intentMutex_);
         for (auto it = intents_.begin(); it != intents_.end(); ++it)
         {
             if (*it && (*it)->intentId == intentId)
             {
+                outVerb = (*it)->verb;
                 intents_.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void BotSession::RecordTerminal(TerminalIntent record)
+    {
+        std::lock_guard<std::mutex> lock(terminalMutex_);
+        terminals_.push_back(std::move(record));
+        while (terminals_.size() > kTerminalRingCap)
+            terminals_.pop_front();
+    }
+
+    bool BotSession::LookupTerminal(uint64_t intentId, TerminalIntent& out) const
+    {
+        std::lock_guard<std::mutex> lock(terminalMutex_);
+        // Scan from newest backward — common case is "I just missed
+        // a completion event seconds ago."
+        for (auto it = terminals_.rbegin(); it != terminals_.rend(); ++it)
+        {
+            if (it->intentId == intentId)
+            {
+                out = *it;
                 return true;
             }
         }

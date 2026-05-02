@@ -87,12 +87,34 @@ namespace Sbywow::Bridge
 
         // Cancel-by-id: remove the matching intent from the queue if
         // present. Returns true on success, false if no queued intent
-        // matches. Used by the cancel_intent verb. The companion
-        // case — cancelling a Wait intent that has already been
-        // popped and is suspending the engine — is handled inside
-        // SbywowAgentEngine::CancelWaitIfMatch, since that state
-        // lives on the engine, not the session.
-        bool   RemoveIntentById(uint64_t intentId);
+        // matches. On success, fills outVerb with the cancelled
+        // intent's verb (so the caller can record it in the
+        // terminal ring). Used by the cancel_intent verb. The
+        // companion case — cancelling a Wait intent that has
+        // already been popped and is suspending the engine — is
+        // handled inside SbywowAgentEngine::CancelWaitIfMatch.
+        bool   RemoveIntentById(uint64_t intentId, std::string& outVerb);
+
+        // Recovery ring for the get_intent sync verb. Every terminal
+        // intent (completed / failed / cancelled) is recorded here
+        // alongside the SSE emit. Bounded ring (kTerminalRingCap)
+        // so an agent harness that missed a completion event can
+        // ask "what happened to intent N" within the recovery
+        // window. See decisions.md "Async intent contract"
+        // (2026-05-02) for the design choice — query primitive
+        // instead of stream-resume.
+        struct TerminalIntent
+        {
+            uint64_t    intentId   = 0;
+            std::string verb;        // original verb (move_to, etc.)
+            std::string kind;        // intent_completed | intent_failed | intent_cancelled
+            std::string state;       // for cancelled: from_queue | interrupted
+            std::string resultJson;  // for completed/failed: serialized result payload
+        };
+        void RecordTerminal(TerminalIntent record);
+        bool LookupTerminal(uint64_t intentId, TerminalIntent& out) const;
+
+        static constexpr size_t kTerminalRingCap = 64;
 
         // Outbound (world → SSE). Push wakes the SSE writer; the writer
         // calls WaitOutbound which blocks until events arrive or timeout.
@@ -127,6 +149,9 @@ namespace Sbywow::Bridge
 
         mutable std::mutex                          intentMutex_;
         std::deque<std::shared_ptr<PendingIntent>>  intents_;
+
+        mutable std::mutex                          terminalMutex_;
+        std::deque<TerminalIntent>                  terminals_;
 
         std::mutex                                  outboundMutex_;
         std::condition_variable                     outboundCv_;

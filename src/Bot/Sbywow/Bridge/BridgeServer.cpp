@@ -878,7 +878,8 @@ namespace Sbywow::Bridge
                 catch (...) { return json{{"ok", false}, {"error", "intent_id must be a uint64 string"}}.dump(); }
 
                 std::string cancelState;
-                if (sess.RemoveIntentById(id))
+                std::string cancelledVerb;
+                if (sess.RemoveIntentById(id, cancelledVerb))
                     cancelState = "from_queue";
                 else
                 {
@@ -886,31 +887,51 @@ namespace Sbywow::Bridge
                     Engine* nc = ai ? ai->GetEngine(BOT_STATE_NON_COMBAT) : nullptr;
                     auto* agentEng = dynamic_cast<Sbywow::SbywowAgentEngine*>(nc);
                     if (agentEng && agentEng->CancelWaitIfMatch(id))
-                        cancelState = "interrupted";
+                    {
+                        cancelState   = "interrupted";
+                        cancelledVerb = "wait";  // only Wait can be in this state
+                    }
                 }
 
                 if (cancelState.empty())
+                {
+                    // Last resort: maybe the intent already terminated.
+                    // Surface the recovery-ring verdict in the error so
+                    // the agent doesn't need a second round-trip.
+                    BotSession::TerminalIntent prior;
+                    if (sess.LookupTerminal(id, prior))
+                        return json{
+                            {"ok",          false},
+                            {"error",       "intent already terminal"},
+                            {"intent_id",   idStr},
+                            {"prior_kind",  prior.kind},
+                            {"prior_verb",  prior.verb},
+                            {"prior_state", prior.state}
+                        }.dump();
                     return json{
                         {"ok", false},
-                        {"error", "intent_id not found (already terminal or never existed)"},
+                        {"error", "intent_id not found (older than recovery ring or never existed)"},
                         {"intent_id", idStr}
                     }.dump();
+                }
 
-                // Emit intent_cancelled. Verb is unknown at this
-                // point (we don't track it for cancelled-from-queue),
-                // so leave verb empty — consumers correlate by
-                // intent_id, the prior intent_queued event already
-                // told them the verb. state="from_queue"|"interrupted"
-                // is the only new info.
                 json ev = {
                     {"channel",   "intent"},
                     {"kind",      "intent_cancelled"},
                     {"bot_guid",  bot->GetGUID().GetRawValue()},
                     {"bot_name",  bot->GetName()},
                     {"intent_id", idStr},
+                    {"verb",      cancelledVerb},
                     {"state",     cancelState}
                 };
                 sess.PushOutbound(ev.dump());
+
+                BotSession::TerminalIntent rec;
+                rec.intentId = id;
+                rec.verb     = cancelledVerb;
+                rec.kind     = "intent_cancelled";
+                rec.state    = cancelState;
+                sess.RecordTerminal(std::move(rec));
 
                 return json{
                     {"ok",        true},
@@ -918,6 +939,49 @@ namespace Sbywow::Bridge
                     {"intent_id", idStr},
                     {"state",     cancelState}
                 }.dump();
+            }
+
+            // get_intent — recovery primitive. Returns the terminal
+            // record for an intent_id that exited the queue/engine
+            // recently (within kTerminalRingCap = 64 entries).
+            // Useful when an SSE consumer reconnected after
+            // disconnection or fell behind the bounded outbound
+            // queue. See decisions.md "Async intent contract"
+            // (2026-05-02) for the choice of query-primitive
+            // over stream-resume.
+            if (verb == "get_intent")
+            {
+                std::string idStr = req.value("intent_id", "");
+                if (idStr.empty())
+                    return json{{"ok", false}, {"error", "get_intent requires intent_id"}}.dump();
+
+                uint64_t id = 0;
+                try { id = std::stoull(idStr); }
+                catch (...) { return json{{"ok", false}, {"error", "intent_id must be a uint64 string"}}.dump(); }
+
+                BotSession::TerminalIntent rec;
+                if (!sess.LookupTerminal(id, rec))
+                    return json{
+                        {"ok",        false},
+                        {"error",     "intent_id not in recent ring (older than 64 terminals or never existed)"},
+                        {"intent_id", idStr}
+                    }.dump();
+
+                json out = {
+                    {"ok",          true},
+                    {"verb",        "get_intent"},
+                    {"intent_id",   idStr},
+                    {"intent_verb", rec.verb},
+                    {"kind",        rec.kind}
+                };
+                if (!rec.state.empty())
+                    out["state"] = rec.state;
+                if (!rec.resultJson.empty())
+                {
+                    try { out["result"] = json::parse(rec.resultJson); }
+                    catch (std::exception const&) { out["result"] = rec.resultJson; }
+                }
+                return out.dump();
             }
 
             json err = { {"ok", false}, {"error", "unknown verb: " + verb} };
