@@ -20,7 +20,8 @@
 #include <unordered_map>
 #include <vector>
 
-ObjectGuid MercenaryFactory::CreateMerc(ObjectGuid ownerGuid, uint8 classId)
+ObjectGuid MercenaryFactory::CreateMerc(ObjectGuid ownerGuid, uint8 classId,
+                                        std::string const& desiredName)
 {
     using namespace std::chrono_literals;
 
@@ -33,6 +34,32 @@ ObjectGuid MercenaryFactory::CreateMerc(ObjectGuid ownerGuid, uint8 classId)
         LOG_ERROR("server.misc",
             "Sbywow: CreateMerc called before service account is bootstrapped");
         return ObjectGuid();
+    }
+
+    // Pre-flight name validation. If the caller supplied a name, fail
+    // fast on bad-length / collision rather than wasting a CreateRandomBot
+    // and discovering it at SaveToDB. Empty string preserves prior
+    // behavior (factory generates a random name).
+    if (!desiredName.empty())
+    {
+        if (desiredName.size() < 2 || desiredName.size() > 12)
+        {
+            LOG_WARN("server.misc",
+                "Sbywow: rejecting merc name '{}' — must be 2..12 chars",
+                desiredName);
+            return ObjectGuid();
+        }
+        std::string esc = desiredName;
+        CharacterDatabase.EscapeString(esc);
+        QueryResult collision = CharacterDatabase.Query(
+            "SELECT 1 FROM characters WHERE name = '{}'", esc);
+        if (collision)
+        {
+            LOG_WARN("server.misc",
+                "Sbywow: rejecting merc name '{}' — already in use",
+                desiredName);
+            return ObjectGuid();
+        }
     }
 
     // Temporary session against the service account. Lifetime ends with this
@@ -59,6 +86,13 @@ ObjectGuid MercenaryFactory::CreateMerc(ObjectGuid ownerGuid, uint8 classId)
     }
 
     ObjectGuid mercGuid = merc->GetGUID();
+
+    // Apply the desired name in-memory before SaveToDB so the rename
+    // persists. Object::SetName is a simple m_name = ...; the merc has
+    // not been added to any session/guild/cache yet, so no other place
+    // is holding the old name.
+    if (!desiredName.empty())
+        merc->SetName(desiredName);
     std::string mercName = merc->GetName();
 
     // Level + gear sync at hire if owner is online. Offline-hire mercs stay at

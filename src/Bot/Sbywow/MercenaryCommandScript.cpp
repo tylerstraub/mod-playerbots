@@ -103,7 +103,7 @@ public:
         std::string arg = args ? args : "";
         if (arg.empty())
         {
-            handler->SendSysMessage("Usage: .merc hire <warrior|paladin|hunter|rogue|priest|dk|shaman|mage|warlock|druid>");
+            handler->SendSysMessage("Usage: .merc hire <class> [name]   (class: warrior|paladin|hunter|rogue|priest|dk|shaman|mage|warlock|druid)");
             return true;
         }
 
@@ -115,17 +115,36 @@ public:
             return true;
         }
 
-        uint8 cls = ParseClassArg(arg);
+        // Split into class [name].
+        std::string classArg, desiredName;
+        std::size_t space = arg.find(' ');
+        if (space == std::string::npos)
+        {
+            classArg = arg;
+        }
+        else
+        {
+            classArg    = arg.substr(0, space);
+            desiredName = arg.substr(space + 1);
+            // Strip trailing whitespace from name.
+            while (!desiredName.empty() && desiredName.back() == ' ')
+                desiredName.pop_back();
+        }
+
+        uint8 cls = ParseClassArg(classArg);
         if (cls == 0)
         {
-            handler->PSendSysMessage("Unknown class: '{}'. Valid: warrior, paladin, hunter, rogue, priest, dk, shaman, mage, warlock, druid.", arg);
+            handler->PSendSysMessage("Unknown class: '{}'. Valid: warrior, paladin, hunter, rogue, priest, dk, shaman, mage, warlock, druid.", classArg);
             return true;
         }
 
-        ObjectGuid mercGuid = MercenaryFactory::CreateMerc(player->GetGUID(), cls);
+        ObjectGuid mercGuid = MercenaryFactory::CreateMerc(player->GetGUID(), cls, desiredName);
         if (mercGuid.IsEmpty())
         {
-            handler->SendSysMessage("Hire failed. Check server log for details.");
+            if (!desiredName.empty())
+                handler->PSendSysMessage("Hire failed — name '{}' may be invalid (must be 2..12 chars and unique). Check server log.", desiredName);
+            else
+                handler->SendSysMessage("Hire failed. Check server log for details.");
             return true;
         }
 
@@ -490,19 +509,34 @@ public:
         std::string a = args ? args : "";
         if (a.empty())
         {
-            handler->SendSysMessage("Usage: .merc admin hire <ownerLowGuid> <class>");
+            handler->SendSysMessage("Usage: .merc admin hire <ownerLowGuid> <class> [name]");
             return true;
         }
 
-        std::size_t space = a.find(' ');
-        if (space == std::string::npos)
+        // Parse: ownerLowGuid <class> [name with possible spaces stripped]
+        std::size_t s1 = a.find(' ');
+        if (s1 == std::string::npos)
         {
-            handler->SendSysMessage("Usage: .merc admin hire <ownerLowGuid> <class>");
+            handler->SendSysMessage("Usage: .merc admin hire <ownerLowGuid> <class> [name]");
             return true;
         }
 
-        uint32 ownerLow = std::strtoul(a.substr(0, space).c_str(), nullptr, 10);
-        std::string classArg = a.substr(space + 1);
+        uint32 ownerLow = std::strtoul(a.substr(0, s1).c_str(), nullptr, 10);
+        std::string rest = a.substr(s1 + 1);
+
+        std::string classArg, desiredName;
+        std::size_t s2 = rest.find(' ');
+        if (s2 == std::string::npos)
+        {
+            classArg = rest;
+        }
+        else
+        {
+            classArg    = rest.substr(0, s2);
+            desiredName = rest.substr(s2 + 1);
+            while (!desiredName.empty() && desiredName.back() == ' ')
+                desiredName.pop_back();
+        }
 
         if (ownerLow == 0)
         {
@@ -518,10 +552,13 @@ public:
         }
 
         ObjectGuid ownerGuid = ObjectGuid::Create<HighGuid::Player>(ownerLow);
-        ObjectGuid mercGuid = MercenaryFactory::CreateMerc(ownerGuid, cls);
+        ObjectGuid mercGuid = MercenaryFactory::CreateMerc(ownerGuid, cls, desiredName);
         if (mercGuid.IsEmpty())
         {
-            handler->SendSysMessage("Hire failed. Check server log for details.");
+            if (!desiredName.empty())
+                handler->PSendSysMessage("Hire failed — name '{}' may be invalid (must be 2..12 chars and unique). Check server log.", desiredName);
+            else
+                handler->SendSysMessage("Hire failed. Check server log for details.");
             return true;
         }
 
