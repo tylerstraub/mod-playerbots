@@ -527,6 +527,9 @@ void AddPlayerbotsSecureLoginScripts();
 
 void AddSC_TempestKeepBotScripts();
 
+// Sbywow: mercenary system entry point — see src/Bot/Sbywow/SbywowLoader.cpp.
+void AddSC_SbywowMercenaryScripts();
+
 void AddPlayerbotsScripts()
 {
     new PlayerbotsBattlefieldScript();
@@ -541,4 +544,5 @@ void AddPlayerbotsScripts()
     AddPlayerbotsCommandscripts();
     PlayerBotsGuildValidationScript();
     AddSC_TempestKeepBotScripts();
+    AddSC_SbywowMercenaryScripts();
 }

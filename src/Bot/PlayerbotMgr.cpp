@@ -20,6 +20,7 @@
 #include "Define.h"
 #include "Group.h"
 #include "GuildMgr.h"
+#include "MercenaryMgr.h"  // sbywow: cross-account merc ownership lookup
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
 #include "PlayerbotAIConfig.h"
@@ -103,12 +104,15 @@ void PlayerbotHolder::AddPlayerBot(ObjectGuid playerGuid, uint32 masterAccountId
     bool sameGuild = sPlayerbotAIConfig.allowGuildBots && guild && guild->GetMember(playerGuid);
     bool addClassBot = sRandomPlayerbotMgr.IsAddclassBot(playerGuid.GetCounter());
     bool linkedAccount = sPlayerbotAIConfig.allowTrustedAccountBots && IsAccountLinked(accountId, masterAccountId);
+    // sbywow: a mercenary owned by this master is allowed even though it lives
+    // on a different (service) account. Ownership is recorded in our table.
+    bool ownedMerc = masterPlayer && sMercenaryMgr.IsOwnedBy(playerGuid, masterPlayer->GetGUID());
 
     bool allowed = true;
     std::ostringstream out;
     std::string botName;
     sCharacterCache->GetCharacterNameByGuid(playerGuid, botName);
-    if (!isRndbot && !sameAccount && !sameGuild && !addClassBot && !linkedAccount)
+    if (!isRndbot && !sameAccount && !sameGuild && !addClassBot && !linkedAccount && !ownedMerc)
     {
         allowed = false;
         out << "Failure: You are not allowed to control bot " << botName.c_str();
@@ -1630,30 +1634,49 @@ void PlayerbotMgr::OnPlayerLogin(Player* player)
     if (sPlayerbotAIConfig.selfBotLevel > 2)
         HandlePlayerbotCommand("self", player);
 
-    if (!sPlayerbotAIConfig.botAutologin)
-        return;
-
     uint32 accountId = session->GetAccountId();
-    QueryResult results = CharacterDatabase.Query("SELECT name FROM characters WHERE account = {}", accountId);
-    if (results)
+    ObjectGuid masterGuid = player->GetGUID();
+
+    std::ostringstream out;
+    out << "add ";
+    bool first = true;
+
+    // Same-account characters — gated on the existing BotAutologin config.
+    if (sPlayerbotAIConfig.botAutologin)
     {
-        std::ostringstream out;
-        out << "add ";
-        bool first = true;
+        if (QueryResult results = CharacterDatabase.Query(
+                "SELECT name FROM characters WHERE account = {}", accountId))
+        {
+            do
+            {
+                Field* fields = results->Fetch();
+                if (first) first = false;
+                else      out << ",";
+                out << fields[0].Get<std::string>();
+            } while (results->NextRow());
+        }
+    }
+
+    // sbywow: mercenaries owned by this master always auto-summon, independent
+    // of BotAutologin (mercs are explicitly hired, not opportunistic alts).
+    // Mercs live on the service account so the same-account query above
+    // doesn't see them.
+    if (QueryResult mercs = CharacterDatabase.Query(
+            "SELECT c.name FROM mod_sbywow_mercenaries m "
+            "JOIN characters c ON c.guid = m.merc_guid WHERE m.owner_guid = {}",
+            masterGuid.GetCounter()))
+    {
         do
         {
-            Field* fields = results->Fetch();
-
-            if (first)
-                first = false;
-            else
-                out << ",";
-
+            Field* fields = mercs->Fetch();
+            if (first) first = false;
+            else      out << ",";
             out << fields[0].Get<std::string>();
-        } while (results->NextRow());
-
-        HandlePlayerbotCommand(out.str().c_str(), player);
+        } while (mercs->NextRow());
     }
+
+    if (!first)
+        HandlePlayerbotCommand(out.str().c_str(), player);
 }
 
 void PlayerbotMgr::TellError(std::string const botName, std::string const text)
