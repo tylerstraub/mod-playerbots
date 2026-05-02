@@ -77,6 +77,14 @@ namespace Sbywow::Bridge
 
         BridgeConfig const& Config() const { return config_; }
 
+        // Mint the next intent_id. Monotonic across the bridge process
+        // lifetime; serialized via std::atomic. We expose this as
+        // uint64 internally; the wire format wraps in a string so
+        // JS-land consumers don't truncate at 2^53. See
+        // decisions.md "Async intent contract: four design questions
+        // resolved" (2026-05-02) for the format choice.
+        uint64_t MintIntentId() { return nextIntentId_.fetch_add(1); }
+
     private:
         BridgeServer() = default;
         ~BridgeServer();
@@ -94,6 +102,11 @@ namespace Sbywow::Bridge
 
         std::mutex                                           sessionsMutex_;
         std::unordered_map<uint64, std::shared_ptr<BotSession>> sessions_;
+
+        // Intent ID source. Starts at 1 — id=0 is reserved as
+        // "unset" so PendingIntent default-construction is
+        // distinguishable from a real id when debugging.
+        std::atomic<uint64_t>                                nextIntentId_{1};
     };
 }
 

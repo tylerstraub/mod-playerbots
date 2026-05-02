@@ -339,18 +339,46 @@ namespace Sbywow::Bridge
         // intent queue, and signal "deferred" to the caller.
         // After this move, cmd->result is in a moved-from state
         // and must not be touched.
-        std::optional<std::string> Defer(BotSession& sess,
+        //
+        // Phase 1 of the async-via-events refactor:
+        //  - Mint an intent_id and stamp it on the PendingIntent
+        //    along with the verb name.
+        //  - Emit an `intent_queued` SSE event so consumers can
+        //    correlate by id.
+        // The HTTP-side promise still resolves at engine
+        // completion (Phase 2 cuts that path); SSE events run
+        // alongside.
+        std::optional<std::string> Defer(Player* bot,
+                                         BotSession& sess,
                                          std::shared_ptr<PendingCommand>& cmd,
+                                         std::string verb,
                                          Sbywow::Intent intent)
         {
+            uint64_t id = BridgeServer::Instance().MintIntentId();
+
             auto pending = std::make_shared<PendingIntent>();
-            pending->intent = std::move(intent);
-            pending->result = std::move(cmd->result);
+            pending->intent   = std::move(intent);
+            pending->result   = std::move(cmd->result);
+            pending->intentId = id;
+            pending->verb     = verb;
+
+            // Emit intent_queued before queueing, so a fast engine
+            // tick can't slip an intent_started in front of us.
+            json ev = {
+                {"channel",   "intent"},
+                {"kind",      "intent_queued"},
+                {"bot_guid",  bot->GetGUID().GetRawValue()},
+                {"bot_name",  bot->GetName()},
+                {"intent_id", std::to_string(id)},
+                {"verb",      verb}
+            };
+            sess.PushOutbound(ev.dump());
+
             sess.PushIntent(std::move(pending));
             return std::nullopt;
         }
 
-        std::optional<std::string> QueueMoveIntent(BotSession& sess,
+        std::optional<std::string> QueueMoveIntent(Player* bot, BotSession& sess,
                                                    std::shared_ptr<PendingCommand>& cmd,
                                                    json const& req)
         {
@@ -365,10 +393,10 @@ namespace Sbywow::Bridge
             i.z = req["z"].get<float>();
             if (req.contains("map") && !req["map"].is_null() && req["map"].is_number_unsigned())
                 i.map = req["map"].get<uint32_t>();
-            return Defer(sess, cmd, std::move(i));
+            return Defer(bot, sess, cmd, "move_to", std::move(i));
         }
 
-        std::optional<std::string> QueueInteractIntent(BotSession& sess,
+        std::optional<std::string> QueueInteractIntent(Player* bot, BotSession& sess,
                                                        std::shared_ptr<PendingCommand>& cmd,
                                                        json const& req)
         {
@@ -378,10 +406,10 @@ namespace Sbywow::Bridge
             Sbywow::Intent i;
             i.kind = Sbywow::IntentKind::Interact;
             i.guid = req["guid"].get<uint64_t>();
-            return Defer(sess, cmd, std::move(i));
+            return Defer(bot, sess, cmd, "interact_with", std::move(i));
         }
 
-        std::optional<std::string> QueueSayIntent(BotSession& sess,
+        std::optional<std::string> QueueSayIntent(Player* bot, BotSession& sess,
                                                   std::shared_ptr<PendingCommand>& cmd,
                                                   json const& req)
         {
@@ -393,10 +421,10 @@ namespace Sbywow::Bridge
             i.kind    = Sbywow::IntentKind::Say;
             i.text    = std::move(text);
             i.channel = req.value("channel", "say");
-            return Defer(sess, cmd, std::move(i));
+            return Defer(bot, sess, cmd, "say", std::move(i));
         }
 
-        std::optional<std::string> QueueDoActionIntent(BotSession& sess,
+        std::optional<std::string> QueueDoActionIntent(Player* bot, BotSession& sess,
                                                        std::shared_ptr<PendingCommand>& cmd,
                                                        json const& req)
         {
@@ -408,10 +436,10 @@ namespace Sbywow::Bridge
             i.kind            = Sbywow::IntentKind::DoAction;
             i.actionName      = std::move(name);
             i.actionQualifier = req.value("qualifier", "");
-            return Defer(sess, cmd, std::move(i));
+            return Defer(bot, sess, cmd, "do_action", std::move(i));
         }
 
-        std::optional<std::string> QueueWaitIntent(BotSession& sess,
+        std::optional<std::string> QueueWaitIntent(Player* bot, BotSession& sess,
                                                    std::shared_ptr<PendingCommand>& cmd,
                                                    json const& req)
         {
@@ -426,7 +454,7 @@ namespace Sbywow::Bridge
             Sbywow::Intent i;
             i.kind   = Sbywow::IntentKind::Wait;
             i.waitMs = ms;
-            return Defer(sess, cmd, std::move(i));
+            return Defer(bot, sess, cmd, "wait", std::move(i));
         }
 
 
@@ -640,7 +668,7 @@ namespace Sbywow::Bridge
             // ExecuteDoAction calls PlayerbotAI::DoSpecificAction
             // — same as the prior inline body, just relocated.
             if (verb == "do_action")
-                return QueueDoActionIntent(sess, cmd, req);
+                return QueueDoActionIntent(bot, sess, cmd, req);
 
             // ---- Strategy management (the nudge layer) ----------------
 
@@ -814,7 +842,7 @@ namespace Sbywow::Bridge
             // ---- Autonomous-driving primitives ------------------------
 
             if (verb == "move_to")
-                return QueueMoveIntent(sess, cmd, req);
+                return QueueMoveIntent(bot, sess, cmd, req);
 
             if (verb == "find_nearby")
                 return DoFindNearby(bot, req);
@@ -824,17 +852,17 @@ namespace Sbywow::Bridge
             // ExecuteInteract on the world thread — same call shape
             // as the prior inline body.
             if (verb == "interact_with")
-                return QueueInteractIntent(sess, cmd, req);
+                return QueueInteractIntent(bot, sess, cmd, req);
 
             // say queues a Say intent.
             if (verb == "say")
-                return QueueSayIntent(sess, cmd, req);
+                return QueueSayIntent(bot, sess, cmd, req);
 
             // wait suspends engine intent dispatch for N ms; useful
             // for chaining "do A, hold, do B" sequences without the
             // harness needing to time-out HTTP round-trips.
             if (verb == "wait")
-                return QueueWaitIntent(sess, cmd, req);
+                return QueueWaitIntent(bot, sess, cmd, req);
 
             json err = { {"ok", false}, {"error", "unknown verb: " + verb} };
             return err.dump();

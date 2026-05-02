@@ -80,6 +80,12 @@ namespace Sbywow
         // threshold (kReactiveCadenceTicks below).
         uint32_t                               idleTickCount_   = 0;
         static constexpr uint32_t              kReactiveCadenceTicks = 50;
+
+        // Current Wait suspension's intent_id + verb (always "wait"),
+        // retained across the suspension so we can emit
+        // intent_completed when isWaiting_ lifts.
+        uint64_t                               waitingIntentId_   = 0;
+        std::string                            waitingIntentVerb_;
     };
 }
 

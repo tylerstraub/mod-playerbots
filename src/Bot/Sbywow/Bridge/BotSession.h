@@ -49,10 +49,19 @@ namespace Sbywow::Bridge
     // when the engine completes the intent — same external timing as
     // synchronous verbs were before, just with the intent queue in
     // the middle.
+    //
+    // intentId / verb are populated at queue time (BridgeServer's
+    // Defer) and travel with the intent so the engine can emit SSE
+    // intent_started / intent_completed / intent_failed events tagged
+    // with the right id and verb. Phase 1 adds the SSE events
+    // alongside the existing promise; Phase 2 cuts HTTP over to
+    // immediate {ok, intent_id} return and drops the promise.
     struct PendingIntent
     {
         Sbywow::Intent             intent;
         std::promise<std::string>  result;
+        uint64_t                   intentId = 0;
+        std::string                verb;
     };
 
     class BotSession : public std::enable_shared_from_this<BotSession>

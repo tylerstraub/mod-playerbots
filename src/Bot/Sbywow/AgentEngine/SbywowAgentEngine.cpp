@@ -66,6 +66,27 @@ namespace Sbywow
                   "[SbywowAgentEngine] filtered strategy add: '{}'", name.c_str());
     }
 
+    namespace
+    {
+        // Build an `intent` channel SSE event envelope. The
+        // BaseEvent shape (channel/kind/bot_guid/bot_name) mirrors
+        // BridgeHooks.cpp; intent_id is wire-stringified to dodge
+        // JS-side 2^53 truncation. result is included for terminal
+        // states only (completed/failed/cancelled).
+        json BuildIntentEvent(Player* bot, std::string const& kind,
+                              uint64_t intentId, std::string const& verb)
+        {
+            return {
+                {"channel",   "intent"},
+                {"kind",      kind},
+                {"bot_guid",  bot->GetGUID().GetRawValue()},
+                {"bot_name",  bot->GetName()},
+                {"intent_id", std::to_string(intentId)},
+                {"verb",      verb}
+            };
+        }
+    }
+
     bool SbywowAgentEngine::DoNextAction(Unit* /*target*/, uint32 /*depth*/, bool /*minimal*/)
     {
         if (!botAI)
@@ -83,6 +104,8 @@ namespace Sbywow
                      bot->GetGUID().GetRawValue(), bot->GetName().c_str());
         }
 
+        auto session = Sbywow::Bridge::BridgeServer::Instance().GetSession(bot->GetGUID());
+
         // Wait suspension: while engaged, no intents drain. Wait is
         // explicit agent-issued sequencing — "do A, hold for N ms,
         // then do B" — implemented as a pause on intent dispatch.
@@ -96,6 +119,20 @@ namespace Sbywow
             if (std::chrono::steady_clock::now() < waitUntil_)
                 return false;  // still waiting
             isWaiting_ = false;
+
+            // Wait reached its end naturally — emit intent_completed
+            // tagged with the wait's id. Phase 4 cancellation will
+            // also clear isWaiting_ but emits intent_cancelled
+            // there instead, so we're safe to claim "completed" here.
+            if (session && waitingIntentId_ != 0)
+            {
+                json ev = BuildIntentEvent(bot, "intent_completed",
+                                           waitingIntentId_, waitingIntentVerb_);
+                ev["result"] = json{{"ok", true}, {"verb", "wait"}};
+                session->PushOutbound(ev.dump());
+            }
+            waitingIntentId_ = 0;
+            waitingIntentVerb_.clear();
         }
 
         // Pop one intent per tick from the per-bot session queue,
@@ -103,7 +140,6 @@ namespace Sbywow
         // BridgeServer is the canonical owner of sessions; if the
         // bridge is down or the session was detached out from under
         // us, we silently no-op (intent was implicitly cancelled).
-        auto session = Sbywow::Bridge::BridgeServer::Instance().GetSession(bot->GetGUID());
         if (!session)
             return false;
 
@@ -117,14 +153,28 @@ namespace Sbywow
             return false;
         }
 
+        // intent_started fires the moment we commit to executing a
+        // popped intent. For sub-tick verbs (Move/Interact/Say/
+        // DoAction) intent_completed lands in the same tick; for
+        // Wait it lands when the suspension expires. Emit before the
+        // dispatch so a slow ExecuteIntent (find_nearby-class work)
+        // doesn't reorder against completed.
+        {
+            json ev = BuildIntentEvent(bot, "intent_started",
+                                       pending->intentId, pending->verb);
+            session->PushOutbound(ev.dump());
+        }
+
         // Wait is special-cased: arm the suspension and respond
         // immediately. Subsequent intents in the queue wait their
         // turn until suspension lifts in a future tick.
         if (pending->intent.kind == IntentKind::Wait)
         {
-            isWaiting_ = true;
-            waitUntil_ = std::chrono::steady_clock::now() +
-                         std::chrono::milliseconds(pending->intent.waitMs);
+            isWaiting_         = true;
+            waitUntil_         = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(pending->intent.waitMs);
+            waitingIntentId_   = pending->intentId;
+            waitingIntentVerb_ = pending->verb;
             json out = {
                 {"ok",       true},
                 {"verb",     "wait"},
@@ -135,8 +185,24 @@ namespace Sbywow
             return true;
         }
 
-        std::string out = ExecuteIntent(bot, pending->intent);
-        try { pending->result.set_value(std::move(out)); }
+        std::string outStr = ExecuteIntent(bot, pending->intent);
+
+        // Translate the verb's `ok` flag into intent_completed vs
+        // intent_failed. Embed the full result payload so consumers
+        // get the same JSON they'd see on the (Phase-1) sync HTTP
+        // response. Parse defensively — engine outputs valid JSON,
+        // but a malformed string shouldn't take down the bridge.
+        json result;
+        try { result = json::parse(outStr); }
+        catch (std::exception const&) { result = {{"ok", false}, {"error", "engine returned non-JSON"}}; }
+        bool ok = result.value("ok", false);
+
+        json ev = BuildIntentEvent(bot, ok ? "intent_completed" : "intent_failed",
+                                   pending->intentId, pending->verb);
+        ev["result"] = result;
+        session->PushOutbound(ev.dump());
+
+        try { pending->result.set_value(std::move(outStr)); }
         catch (std::future_error const&) { /* receiver gone — drop */ }
 
         return true;
