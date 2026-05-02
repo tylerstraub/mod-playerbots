@@ -33,11 +33,18 @@ namespace Sbywow::Bridge
 
     struct BridgeConfig
     {
-        bool        enable             = true;
-        std::string host               = "127.0.0.1";
-        int         port               = 8889;
-        std::string secret;                    // empty = auth disabled
-        int         heartbeatTimeoutMs = 30000;
+        bool        enable               = true;
+        std::string host                 = "127.0.0.1";
+        int         port                 = 8889;
+        std::string secret;                       // empty = auth disabled
+        int         heartbeatTimeoutMs   = 30000;
+        // Snapshot cadence: emit one `snapshot.state` event per N
+        // OnPlayerUpdate calls. Default 500 ≈ 3-4 events/sec under
+        // active autonomic load (we measured ~1750 OnPlayerUpdate
+        // calls/sec). Pre-tuning default was 50 which produced 35/sec
+        // — order of magnitude more than any agent harness needs.
+        // Tune via `Sbywow.Bridge.SnapshotEveryNUpdates`.
+        uint32      snapshotEveryNUpdates = 500;
     };
 
     class BridgeServer

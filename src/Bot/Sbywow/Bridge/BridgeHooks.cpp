@@ -35,10 +35,9 @@ namespace
 {
     using namespace Sbywow::Bridge;
 
-    // Snapshot cadence: emit a periodic state event every Nth tick of
-    // OnPlayerUpdate so the agent always has fresh ground-truth context.
-    // 50 update calls ≈ ~2.5s at default cadence; tune later.
-    constexpr uint32 kSnapshotEveryNUpdates = 50;
+    // Snapshot cadence is sourced from BridgeServer config
+    // (Sbywow.Bridge.SnapshotEveryNUpdates, default 500). See
+    // BridgeServer.h::BridgeConfig for tuning rationale.
 
     bool IsAttachedBot(Player* player)
     {
@@ -200,7 +199,9 @@ namespace
 
             // Periodic state snapshot.
             uint32& tick = updateTickByGuid_[player->GetGUID().GetRawValue()];
-            if (++tick % kSnapshotEveryNUpdates != 0)
+            uint32 cadence = BridgeServer::Instance().Config().snapshotEveryNUpdates;
+            if (cadence == 0) cadence = 1;
+            if (++tick % cadence != 0)
                 return;
 
             json ev = BaseEvent(player, "snapshot", "state");

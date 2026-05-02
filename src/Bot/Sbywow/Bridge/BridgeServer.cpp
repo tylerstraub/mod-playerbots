@@ -52,6 +52,8 @@ namespace Sbywow::Bridge
         config_.port               = sConfigMgr->GetOption<int32>      ("Sbywow.Bridge.Port",               8889);
         config_.secret             = sConfigMgr->GetOption<std::string>("Sbywow.Bridge.Secret",             "");
         config_.heartbeatTimeoutMs = sConfigMgr->GetOption<int32>      ("Sbywow.Bridge.HeartbeatTimeoutMs", 30000);
+        config_.snapshotEveryNUpdates =
+            static_cast<uint32>(sConfigMgr->GetOption<int32>("Sbywow.Bridge.SnapshotEveryNUpdates", 500));
     }
 
     bool BridgeServer::CheckAuth(std::string const& authHeader) const
