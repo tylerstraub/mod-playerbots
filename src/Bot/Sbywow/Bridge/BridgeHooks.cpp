@@ -18,10 +18,7 @@
 #include "BotSession.h"
 #include "deps/json.hpp"
 
-#include "../AgentEngine/SbywowAgentEngine.h"
-
 #include "Creature.h"
-#include "Engine.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
@@ -151,43 +148,32 @@ namespace
 
             BridgeServer::Instance().TickBot(player);
 
-            // Periodic state snapshot.
+            // Periodic state snapshot. Carries the full structured
+            // context block — same shape served by `get_context` and
+            // embedded in `inspect`. The agent harness keeps the most
+            // recent snapshot warm in memory and reads it on every
+            // wake, never having to call a verb to learn its own HP /
+            // gold / inventory / master state. See decisions.md
+            // "Tool surface is for actions and deep discovery"
+            // (2026-05-02) for the architectural reasoning.
             uint32& tick = updateTickByGuid_[player->GetGUID().GetRawValue()];
             uint32 cadence = BridgeServer::Instance().Config().snapshotEveryNUpdates;
             if (cadence == 0) cadence = 1;
             if (++tick % cadence != 0)
                 return;
 
-            json ev = BaseEvent(player, "snapshot", "state");
-            ev["hp_pct"]    = static_cast<int>(player->GetHealthPct());
-            ev["map"]       = player->GetMapId();
-            ev["zone"]      = player->GetZoneId();
-            ev["pos"]       = { player->GetPositionX(), player->GetPositionY(), player->GetPositionZ() };
-            ev["in_combat"] = player->IsInCombat();
-            ev["alive"]     = player->IsAlive();
-            ev["level"]     = player->GetLevel();
+            auto session = BridgeServer::Instance().GetSession(player->GetGUID());
+            if (!session)
+                return;
 
-            // Engine progress fields — agent harness uses these to
-            // reason about "is my queued intent making progress?"
-            // without round-tripping through inspect or scrubbing
-            // the SSE history.
-            if (auto session = BridgeServer::Instance().GetSession(player->GetGUID()))
-            {
-                ev["intent_count"] = static_cast<int>(session->IntentCount());
-                ev["agent_mode"]   = session->IsAgentMode();
-            }
-            if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(player))
-            {
-                if (auto* agentEng = dynamic_cast<Sbywow::SbywowAgentEngine*>(
-                        ai->GetEngine(BOT_STATE_NON_COMBAT)))
-                {
-                    ev["is_waiting"]           = agentEng->IsWaiting();
-                    ev["waiting_intent_id"]    = agentEng->WaitingIntentId() != 0
-                                                 ? json(std::to_string(agentEng->WaitingIntentId()))
-                                                 : json(nullptr);
-                    ev["waiting_remaining_ms"] = agentEng->WaitingRemainingMs();
-                }
-            }
+            json ev = BaseEvent(player, "snapshot", "state");
+            json ctx = Sbywow::Bridge::BuildContextSnapshot(player, *session);
+            // Merge the context block fields directly into the event
+            // envelope. Top-level shape is {channel, kind, bot_guid,
+            // bot_name, self, master, inventory, group, active_intents,
+            // session}.
+            for (auto it = ctx.begin(); it != ctx.end(); ++it)
+                ev[it.key()] = std::move(it.value());
             EmitEvent(player, ev);
         }
 

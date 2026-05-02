@@ -15,6 +15,7 @@
 #define _SBYWOW_BRIDGE_SERVER_H
 
 #include "ObjectGuid.h"
+#include "deps/json.hpp"
 
 #include <atomic>
 #include <memory>
@@ -30,6 +31,15 @@ namespace httplib { class Server; }
 namespace Sbywow::Bridge
 {
     class BotSession;
+
+    // Build the structured context snapshot for the agent harness's
+    // wake context. Same shape feeds three access patterns:
+    //   - SSE event `snapshot.state` (periodic, BridgeHooks)
+    //   - sync verb `get_context` (cold start / explicit refresh)
+    //   - `inspect` verb (debug, embeds the same block as `context`)
+    // World-thread only — reads Player* and engine state directly.
+    // Schema: see docs/agent-interface.md "Context snapshot block."
+    nlohmann::json BuildContextSnapshot(Player* bot, BotSession& sess);
 
     struct BridgeConfig
     {

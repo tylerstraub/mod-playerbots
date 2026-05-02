@@ -7,6 +7,7 @@
 #include "../MercenaryMgr.h"
 
 #include "AiObjectContext.h"
+#include "Bag.h"
 #include "Cell.h"
 #include "CellImpl.h"
 #include "Config.h"
@@ -16,13 +17,18 @@
 #include "GossipDef.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
+#include "Group.h"
+#include "Item.h"
+#include "ItemTemplate.h"
 #include "Log.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "SharedDefines.h"
 #include "Value.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
@@ -249,6 +255,523 @@ namespace Sbywow::Bridge
     }
 
     // -----------------------------------------------------------------------
+    // Context snapshot — single source of truth for the agent harness's
+    // wake context. Same payload feeds (a) the periodic `snapshot.state`
+    // SSE event, (b) the `get_context` sync verb, (c) the `inspect`
+    // verb's embedded `context` field. All callers run on the world
+    // thread; the function reads Player*, master Player*, and engine
+    // state directly. See decisions.md "Tool surface is for actions
+    // and deep discovery" (2026-05-02) for the architectural reasoning.
+    // Schema documented in docs/agent-interface.md "Context snapshot
+    // block" — keep them in sync.
+    // -----------------------------------------------------------------------
+
+    namespace
+    {
+        // Static name table for the equipped block. Indexed by
+        // EQUIPMENT_SLOT_HEAD (0) .. EQUIPMENT_SLOT_TABARD (18).
+        char const* kEquipSlotName[EQUIPMENT_SLOT_END] = {
+            "head", "neck", "shoulders", "shirt", "chest", "waist",
+            "legs", "feet", "wrists", "hands", "finger1", "finger2",
+            "trinket1", "trinket2", "back", "main_hand", "off_hand",
+            "ranged", "tabard"
+        };
+
+        char const* QualityName(uint32 q)
+        {
+            switch (q)
+            {
+                case ITEM_QUALITY_POOR:      return "poor";
+                case ITEM_QUALITY_NORMAL:    return "normal";
+                case ITEM_QUALITY_UNCOMMON:  return "uncommon";
+                case ITEM_QUALITY_RARE:      return "rare";
+                case ITEM_QUALITY_EPIC:      return "epic";
+                case ITEM_QUALITY_LEGENDARY: return "legendary";
+                case ITEM_QUALITY_ARTIFACT:  return "artifact";
+                case ITEM_QUALITY_HEIRLOOM:  return "heirloom";
+                default:                     return "unknown";
+            }
+        }
+
+        char const* PowerName(Powers p)
+        {
+            switch (p)
+            {
+                case POWER_MANA:        return "mana";
+                case POWER_RAGE:        return "rage";
+                case POWER_FOCUS:       return "focus";
+                case POWER_ENERGY:      return "energy";
+                case POWER_HAPPINESS:   return "happiness";
+                case POWER_RUNE:        return "rune";
+                case POWER_RUNIC_POWER: return "runic_power";
+                default:                return "unknown";
+            }
+        }
+
+        // Build a {power_type, power, power_max, power_pct} sub-object for
+        // a Unit. Reflects the unit's *current* primary power — for shifted
+        // druids this swings (rage in bear form, energy in cat form).
+        json BuildPowerBlock(Unit const* u)
+        {
+            Powers pt = u->getPowerType();
+            uint32 cur = u->GetPower(pt);
+            uint32 mx  = u->GetMaxPower(pt);
+            return {
+                {"power_type", PowerName(pt)},
+                {"power",      cur},
+                {"power_max",  mx},
+                {"power_pct",  mx ? static_cast<int>(100ULL * cur / mx) : 0}
+            };
+        }
+
+        // Quality rank for sorting "other" items by quality desc. Lower
+        // index = higher rank.
+        int QualityRank(uint32 q)
+        {
+            switch (q)
+            {
+                case ITEM_QUALITY_LEGENDARY: return 0;
+                case ITEM_QUALITY_EPIC:      return 1;
+                case ITEM_QUALITY_RARE:      return 2;
+                case ITEM_QUALITY_UNCOMMON:  return 3;
+                case ITEM_QUALITY_NORMAL:    return 4;
+                case ITEM_QUALITY_POOR:      return 5;
+                case ITEM_QUALITY_HEIRLOOM:  return 6;
+                case ITEM_QUALITY_ARTIFACT:  return 7;
+                default:                     return 8;
+            }
+        }
+
+        char const* ConsumableBucket(ItemTemplate const* tpl)
+        {
+            if (!tpl || tpl->Class != ITEM_CLASS_CONSUMABLE) return nullptr;
+            switch (tpl->SubClass)
+            {
+                case ITEM_SUBCLASS_POTION:           return "potion";
+                case ITEM_SUBCLASS_ELIXIR:           return "elixir";
+                case ITEM_SUBCLASS_FLASK:            return "flask";
+                case ITEM_SUBCLASS_SCROLL:           return "scroll";
+                case ITEM_SUBCLASS_FOOD:             return "food_drink";
+                case ITEM_SUBCLASS_BANDAGE:          return "bandage";
+                case ITEM_SUBCLASS_ITEM_ENHANCEMENT: return "item_enhancement";
+                default:                             return "consumable_other";
+            }
+        }
+
+        // Walk every non-equipped, non-bank slot and call fn(Item*).
+        // Equipment slots are intentionally NOT included here — those are
+        // surfaced separately as `equipped` per-slot. Bank items are
+        // never relevant to in-world bot behavior, so they're excluded
+        // unconditionally.
+        template <typename Fn>
+        void ForEachNonEquippedItem(Player* bot, Fn const& fn)
+        {
+            // Backpack (slots 23..38).
+            for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+                if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                    fn(it);
+
+            // Keyring + currency (slots 86..149). Cheap; usually empty.
+            for (uint8 i = KEYRING_SLOT_START; i < CURRENCYTOKEN_SLOT_END; ++i)
+                if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                    fn(it);
+
+            // Bag slots (19..22) — recurse into each Bag.
+            for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
+            {
+                Bag* pBag = bot->GetBagByPos(i);
+                if (!pBag) continue;
+                for (uint32 j = 0; j < pBag->GetBagSize(); ++j)
+                    if (Item* it = bot->GetItemByPos(i, j))
+                        fn(it);
+            }
+        }
+
+        // Count used vs. total non-equipped, non-keyring slots:
+        // backpack 16 + each bag's GetBagSize.
+        void CountInventorySlots(Player* bot, int& used, int& total)
+        {
+            used = 0;
+            total = INVENTORY_SLOT_ITEM_END - INVENTORY_SLOT_ITEM_START;  // 16
+
+            for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+                if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                    ++used;
+
+            for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
+            {
+                Bag* pBag = bot->GetBagByPos(i);
+                if (!pBag) continue;
+                int sz = static_cast<int>(pBag->GetBagSize());
+                total += sz;
+                for (int j = 0; j < sz; ++j)
+                    if (bot->GetItemByPos(i, static_cast<uint8>(j)))
+                        ++used;
+            }
+        }
+    }
+
+    nlohmann::json BuildContextSnapshot(Player* bot, BotSession& sess)
+    {
+        if (!bot)
+            return json::object();
+
+        PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+
+        // ---- self ----
+        uint32 health    = bot->GetHealth();
+        uint32 healthMax = bot->GetMaxHealth();
+        json power       = BuildPowerBlock(bot);
+        json self = {
+            {"name",       bot->GetName()},
+            {"level",      bot->GetLevel()},
+            {"class_id",   static_cast<int>(bot->getClass())},
+            {"race_id",    static_cast<int>(bot->getRace())},
+            {"hp",         health},
+            {"hp_max",     healthMax},
+            {"hp_pct",     healthMax ? static_cast<int>(100ULL * health / healthMax) : 0},
+            {"power_type", power["power_type"]},
+            {"power",      power["power"]},
+            {"power_max",  power["power_max"]},
+            {"power_pct",  power["power_pct"]},
+            {"position",   {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
+            {"map",        bot->GetMapId()},
+            {"zone",       bot->GetZoneId()},
+            {"area",       bot->GetAreaId()},
+            {"alive",      bot->IsAlive()},
+            {"in_combat",  bot->IsInCombat()},
+            {"mounted",    bot->IsMounted()},
+            {"afk",        bot->isAFK()}
+        };
+
+        // ---- master ----
+        Player* master = ai ? ai->GetMaster() : nullptr;
+        json masterJson = nullptr;
+        if (master)
+        {
+            uint32 mh  = master->GetHealth();
+            uint32 mhm = master->GetMaxHealth();
+            json mpower = BuildPowerBlock(master);
+
+            json target = nullptr;
+            ObjectGuid targetGuid = master->GetTarget();
+            if (targetGuid)
+            {
+                if (Unit* tgt = ObjectAccessor::GetUnit(*master, targetGuid))
+                {
+                    char const* kind = "unit";
+                    if (tgt->ToCreature())    kind = "creature";
+                    else if (tgt->ToPlayer()) kind = "player";
+                    target = {
+                        {"guid",    targetGuid.GetRawValue()},
+                        {"name",    tgt->GetName()},
+                        {"kind",    kind},
+                        {"hostile", tgt->IsHostileTo(master)},
+                        {"hp_pct",  static_cast<int>(tgt->GetHealthPct())},
+                        {"alive",   tgt->IsAlive()}
+                    };
+                }
+            }
+
+            masterJson = {
+                {"name",       master->GetName()},
+                {"level",      master->GetLevel()},
+                {"class_id",   static_cast<int>(master->getClass())},
+                {"race_id",    static_cast<int>(master->getRace())},
+                {"hp",         mh},
+                {"hp_max",     mhm},
+                {"hp_pct",     mhm ? static_cast<int>(100ULL * mh / mhm) : 0},
+                {"power_type", mpower["power_type"]},
+                {"power_pct",  mpower["power_pct"]},
+                {"position",   {master->GetPositionX(), master->GetPositionY(), master->GetPositionZ()}},
+                {"map",        master->GetMapId()},
+                {"zone",       master->GetZoneId()},
+                {"area",       master->GetAreaId()},
+                {"distance",   bot->GetExactDist(master)},
+                {"online",     true},   // master pointer non-null implies in-world
+                {"alive",      master->IsAlive()},
+                {"in_combat",  master->IsInCombat()},
+                {"mounted",    master->IsMounted()},
+                {"afk",        master->isAFK()},
+                {"target",     target}
+            };
+        }
+
+        // ---- inventory ----
+        uint32 money = bot->GetMoney();
+        json inventory;
+        {
+            // Equipped per-slot (always inline; bounded at 19 entries).
+            json equipped = json::object();
+            for (uint8 i = EQUIPMENT_SLOT_START; i < EQUIPMENT_SLOT_END; ++i)
+            {
+                Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
+                if (!it) continue;
+                ItemTemplate const* tpl = it->GetTemplate();
+                if (!tpl) continue;
+                equipped[kEquipSlotName[i]] = {
+                    {"entry",   tpl->ItemId},
+                    {"name",    tpl->Name1},
+                    {"ilvl",    tpl->ItemLevel},
+                    {"quality", QualityName(tpl->Quality)}
+                };
+            }
+
+            // Aggregate non-equipped items by item entry — packed bots
+            // hold many stacks of the same trade-good / consumable, and
+            // the agent doesn't need separate stack-count entries.
+            //
+            // Consumables are *partitioned out* into their own block; they
+            // do NOT appear in stacked[] / quest_items / notable / other.
+            // This avoids the LLM-trap where the same item appears twice
+            // (once in the consumables rollup, once in `other`) and the
+            // agent double-counts. A consumable's specific entry/name is
+            // available in consumables.<bucket>.items.
+            struct Stack
+            {
+                ItemTemplate const* tpl   = nullptr;
+                uint32              count = 0;
+            };
+            std::map<uint32, Stack>            stacked;
+
+            // Consumables: per-bucket {total, items}. Items are aggregated
+            // by entry across multiple stacks of the same item.
+            struct ConsumableEntry
+            {
+                ItemTemplate const* tpl   = nullptr;
+                uint32              count = 0;
+            };
+            std::map<std::string, std::map<uint32, ConsumableEntry>> consumablesByBucket;
+            std::map<std::string, uint32>                            consumableTotals;
+
+            ForEachNonEquippedItem(bot, [&](Item* it) {
+                ItemTemplate const* tpl = it->GetTemplate();
+                if (!tpl) return;
+                uint32 cnt = it->GetCount();
+                if (char const* bucket = ConsumableBucket(tpl))
+                {
+                    auto& ce = consumablesByBucket[bucket][tpl->ItemId];
+                    ce.tpl    = tpl;
+                    ce.count += cnt;
+                    consumableTotals[bucket] += cnt;
+                }
+                else
+                {
+                    auto& s = stacked[tpl->ItemId];
+                    s.tpl    = tpl;
+                    s.count += cnt;
+                }
+            });
+
+            json questItems = json::array();
+            json notable    = json::array();
+            json other      = json::array();
+
+            // Sort entries by quality desc / count desc within "other".
+            // questItems and notable retain insertion order; the LLM
+            // doesn't care, and stable-by-entry is fine for those.
+            std::vector<Stack const*> otherSorted;
+            otherSorted.reserve(stacked.size());
+
+            for (auto const& [entry, st] : stacked)
+            {
+                ItemTemplate const* tpl = st.tpl;
+                json one = {
+                    {"entry",   tpl->ItemId},
+                    {"name",    tpl->Name1},
+                    {"count",   st.count},
+                    {"quality", QualityName(tpl->Quality)}
+                };
+                bool isQuest   = (tpl->Class == ITEM_CLASS_QUEST) || tpl->StartQuest != 0;
+                bool isNotable = tpl->Quality >= ITEM_QUALITY_RARE;
+                if (isQuest)
+                    questItems.push_back(std::move(one));
+                else if (isNotable)
+                    notable.push_back(std::move(one));
+                else
+                    otherSorted.push_back(&st);
+            }
+
+            std::sort(otherSorted.begin(), otherSorted.end(),
+                      [](Stack const* a, Stack const* b) {
+                          int ra = QualityRank(a->tpl->Quality);
+                          int rb = QualityRank(b->tpl->Quality);
+                          if (ra != rb) return ra < rb;
+                          return a->count > b->count;
+                      });
+
+            for (Stack const* st : otherSorted)
+            {
+                ItemTemplate const* tpl = st->tpl;
+                other.push_back({
+                    {"entry",   tpl->ItemId},
+                    {"name",    tpl->Name1},
+                    {"count",   st->count},
+                    {"quality", QualityName(tpl->Quality)}
+                });
+            }
+
+            // Cap combined unique-entry count at kInventoryCap. quest+notable
+            // are always kept; trim "other" only.
+            constexpr size_t kInventoryCap = 50;
+            bool truncated = false;
+            size_t reserved = questItems.size() + notable.size();
+            if (reserved >= kInventoryCap)
+            {
+                if (!other.empty())
+                {
+                    other = json::array();
+                    truncated = true;
+                }
+            }
+            else
+            {
+                size_t budget = kInventoryCap - reserved;
+                if (other.size() > budget)
+                {
+                    json trimmed = json::array();
+                    for (size_t i = 0; i < budget; ++i)
+                        trimmed.push_back(std::move(other[i]));
+                    other = std::move(trimmed);
+                    truncated = true;
+                }
+            }
+
+            int slotsUsed = 0, slotsTotal = 0;
+            CountInventorySlots(bot, slotsUsed, slotsTotal);
+
+            uint32 g = money / 10000;
+            uint32 s = (money / 100) % 100;
+            uint32 c = money % 100;
+
+            // Render consumables: per-bucket {total, items: [{entry, name, count}]}.
+            // Buckets included only if non-empty (sparse object).
+            json consumablesJson = json::object();
+            for (auto const& [bucket, total] : consumableTotals)
+            {
+                json items = json::array();
+                auto bit = consumablesByBucket.find(bucket);
+                if (bit != consumablesByBucket.end())
+                {
+                    for (auto const& [entry, ce] : bit->second)
+                    {
+                        items.push_back({
+                            {"entry", ce.tpl->ItemId},
+                            {"name",  ce.tpl->Name1},
+                            {"count", ce.count}
+                        });
+                    }
+                }
+                consumablesJson[bucket] = {
+                    {"total", total},
+                    {"items", items}
+                };
+            }
+
+            inventory = {
+                {"money",       {{"gold", g}, {"silver", s}, {"copper", c}, {"raw", money}}},
+                {"slot_usage",  {{"used", slotsUsed}, {"total", slotsTotal}}},
+                {"equipped",    equipped},
+                {"consumables", consumablesJson},
+                {"quest_items", questItems},
+                {"notable",     notable},
+                {"other",       other},
+                {"truncated",   truncated}
+            };
+        }
+
+        // ---- group ----
+        json groupJson = nullptr;
+        if (Group* group = bot->GetGroup())
+        {
+            json members = json::array();
+            for (auto ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                if (Player* m = ref->GetSource())
+                    members.push_back(m->GetName());
+            }
+            char const* lootMethod = "unknown";
+            switch (group->GetLootMethod())
+            {
+                case FREE_FOR_ALL:      lootMethod = "free_for_all";      break;
+                case ROUND_ROBIN:       lootMethod = "round_robin";       break;
+                case MASTER_LOOT:       lootMethod = "master_loot";       break;
+                case GROUP_LOOT:        lootMethod = "group_loot";        break;
+                case NEED_BEFORE_GREED: lootMethod = "need_before_greed"; break;
+            }
+            std::string leaderName;
+            if (char const* ln = group->GetLeaderName())
+                leaderName = ln;
+            groupJson = {
+                {"leader_name", leaderName},
+                {"members",     members},
+                {"loot_method", lootMethod},
+                {"is_raid",     group->isRaidGroup()},
+                {"in_dungeon",  bot->GetMap() && bot->GetMap()->IsDungeon()}
+            };
+        }
+
+        // ---- active_intents ----
+        // Order: in-flight Wait suspension (head of execution) first,
+        // then queued in queue order. Wait is the only intent kind that
+        // persists across multiple ticks — sub-tick intents
+        // (move/interact/say/do_action) terminate inside the same tick
+        // they're popped, so they're never visible as "in_flight."
+        json activeIntents = json::array();
+        Sbywow::SbywowAgentEngine* agentEng = nullptr;
+        if (ai)
+            agentEng = dynamic_cast<Sbywow::SbywowAgentEngine*>(ai->GetEngine(BOT_STATE_NON_COMBAT));
+        if (agentEng && agentEng->IsWaiting())
+        {
+            activeIntents.push_back({
+                {"intent_id",         std::to_string(agentEng->WaitingIntentId())},
+                {"verb",              agentEng->WaitingIntentVerb()},
+                {"kind",              "wait"},
+                {"status",            "waiting"},
+                {"wait_remaining_ms", agentEng->WaitingRemainingMs()}
+            });
+        }
+        for (auto const& iv : sess.ProjectIntents())
+        {
+            activeIntents.push_back({
+                {"intent_id", std::to_string(iv.intentId)},
+                {"verb",      iv.verb},
+                {"kind",      iv.kind},
+                {"status",    "queued"}
+            });
+        }
+
+        // ---- session ----
+        uint64_t intentsTotal   = 0;
+        uint64_t ticksTotal     = 0;
+        uint64_t reactivesTotal = 0;
+        if (agentEng)
+        {
+            intentsTotal   = agentEng->IntentsDispatchedTotal();
+            ticksTotal     = agentEng->TicksTotal();
+            reactivesTotal = agentEng->ReactivesFiredTotal();
+        }
+        json session = {
+            {"agent_mode",               sess.IsAgentMode()},
+            {"uptime_ms",                sess.UptimeMs()},
+            {"heartbeat_ms",             sess.HeartbeatAgeMs()},
+            {"sse_attached",             sess.IsSseAttached()},
+            {"intents_dispatched_total", intentsTotal},
+            {"ticks_total",              ticksTotal},
+            {"reactives_fired_total",    reactivesTotal}
+        };
+
+        return json{
+            {"self",           self},
+            {"master",         masterJson},
+            {"inventory",      inventory},
+            {"group",          groupJson},
+            {"active_intents", activeIntents},
+            {"session",        session}
+        };
+    }
+
+    // -----------------------------------------------------------------------
     // Command dispatch (runs on the world thread, called from TickBot)
     // -----------------------------------------------------------------------
 
@@ -297,31 +820,18 @@ namespace Sbywow::Bridge
 
         // ---- Diagnostic / debug instrument ------------------------
         //
-        // Surfaces everything we want visible during engine-replacement
-        // work: which engine subclass is installed in each state slot,
-        // bot session account-id vs cached service-account-id, master
-        // pointer state, current engine, last action. Adding this as a
-        // first-class verb (not a one-off log) so future engine work
-        // has a real instrument instead of LOG_INFO archaeology.
+        // Surfaces the structured context snapshot (same shape as the
+        // periodic snapshot.state SSE event and the get_context verb)
+        // plus debug-only extras: engine slot dispatch (which engine
+        // subclass is installed in each state slot, strategy counts),
+        // sbywow agent-bonded predicate, default-engine internals.
+        // Use this when bot internals don't match expectations — the
+        // operational state lives in `context`, the "why doesn't the
+        // engine think what I think" lives in `engines` / `sbywow` /
+        // `agent_engine_debug`.
         std::string DoInspect(Player* bot, BotSession& sess)
         {
             PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
-
-            json botInfo = {
-                {"guid",               bot->GetGUID().GetRawValue()},
-                {"name",               bot->GetName()},
-                {"session_account_id", bot->GetSession() ? bot->GetSession()->GetAccountId() : 0},
-                {"level",              bot->GetLevel()},
-                {"class_id",           static_cast<int>(bot->getClass())},
-                {"race_id",            static_cast<int>(bot->getRace())},
-                {"map",                bot->GetMapId()},
-                {"zone",               bot->GetZoneId()},
-                {"area",               bot->GetAreaId()},
-                {"pos",                {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
-                {"in_combat",          bot->IsInCombat()},
-                {"alive",              bot->IsAlive()},
-                {"is_afk",             bot->isAFK()}
-            };
 
             // Engine slot inspection — dynamic_cast detects whether
             // our SbywowAgentEngine is installed. Adding new engine
@@ -334,7 +844,7 @@ namespace Sbywow::Bridge
             };
 
             json engineInfo;
-            json agentEngineState;  // populated only when non_combat is SbywowAgentEngine
+            json agentEngineDebug;  // populated only when non_combat is SbywowAgentEngine
             if (ai)
             {
                 Engine* combat    = ai->GetEngine(BOT_STATE_COMBAT);
@@ -356,57 +866,37 @@ namespace Sbywow::Bridge
                     }}
                 };
 
-                // When non_combat is our SbywowAgentEngine, surface its
-                // wait-suspension state plus tick counters. Closes the
-                // "why isn't my move_to executing?" question without an
-                // SSE-scrub round trip. waitingIntentId stringified for
-                // wire consistency with the rest of the intent contract.
+                // The agent-engine "debug" block carries fields that are
+                // NOT in the context snapshot (and shouldn't be — they're
+                // internals, not operational state). Wait state and
+                // counters are now sourced from context.session +
+                // context.active_intents to avoid duplication.
                 if (auto* agentEng = dynamic_cast<Sbywow::SbywowAgentEngine*>(nonCombat))
                 {
-                    agentEngineState = {
-                        {"agent_mode",                       sess.IsAgentMode()},
+                    agentEngineDebug = {
                         {"default_engine_strategies_count",  static_cast<int>(agentEng->DefaultEngineStrategiesCount())},
-                        {"default_engine_ticks_total",       agentEng->DefaultEngineTicksTotal()},
-                        {"is_waiting",                       agentEng->IsWaiting()},
-                        {"waiting_intent_id",                agentEng->WaitingIntentId() != 0
-                                                             ? json(std::to_string(agentEng->WaitingIntentId()))
-                                                             : json(nullptr)},
-                        {"waiting_intent_verb",              agentEng->WaitingIntentVerb()},
-                        {"waiting_remaining_ms",             agentEng->WaitingRemainingMs()},
-                        {"ticks_total",                      agentEng->TicksTotal()},
-                        {"intents_dispatched_total",         agentEng->IntentsDispatchedTotal()},
-                        {"reactives_fired_total",            agentEng->ReactivesFiredTotal()}
+                        {"default_engine_ticks_total",       agentEng->DefaultEngineTicksTotal()}
                     };
                 }
-
-                Player* master = ai->GetMaster();
-                botInfo["has_master"]  = (master != nullptr);
-                botInfo["master_name"] = master ? master->GetName() : "";
-                botInfo["master_guid"] = master ? master->GetGUID().GetRawValue() : 0ULL;
             }
 
             json sbywowInfo = {
                 {"is_agent_bonded",     Sbywow::IsAgentBonded(bot)},
-                {"service_account_id",  sMercenaryMgr.GetServiceAccountId()}
-            };
-
-            json sessionInfo = {
-                {"heartbeat_ms",   sess.HeartbeatAgeMs()},
-                {"agent_mode",     sess.IsAgentMode()},
-                {"sse_attached",   sess.IsSseAttached()},
-                {"intent_count",   static_cast<int>(sess.IntentCount())}
+                {"service_account_id",  sMercenaryMgr.GetServiceAccountId()},
+                {"bot_guid",            bot->GetGUID().GetRawValue()},
+                {"bot_session_account_id",
+                                        bot->GetSession() ? bot->GetSession()->GetAccountId() : 0}
             };
 
             json out = {
-                {"ok",       true},
-                {"verb",     "inspect"},
-                {"bot",      botInfo},
-                {"engines",  engineInfo},
-                {"sbywow",   sbywowInfo},
-                {"session",  sessionInfo}
+                {"ok",      true},
+                {"verb",    "inspect"},
+                {"context", BuildContextSnapshot(bot, sess)},
+                {"engines", engineInfo},
+                {"sbywow",  sbywowInfo}
             };
-            if (!agentEngineState.is_null())
-                out["agent_engine"] = std::move(agentEngineState);
+            if (!agentEngineDebug.is_null())
+                out["agent_engine_debug"] = std::move(agentEngineDebug);
             return out.dump();
         }
 
@@ -927,6 +1417,25 @@ namespace Sbywow::Bridge
 
             if (verb == "inspect")
                 return DoInspect(bot, sess);
+
+            // get_context — sync verb returning the same structured
+            // payload the agent harness sees on every snapshot.state
+            // SSE event. Used for cold-start (harness just connected,
+            // no warm snapshot yet) or explicit refresh ("things might
+            // have shifted since the last tick"). Bridge-side cost is
+            // a single BuildContextSnapshot call. See decisions.md
+            // "Tool surface is for actions and deep discovery"
+            // (2026-05-02) for the architectural reasoning — verbs
+            // are for actions and deep discovery; continuous state
+            // is pushed via the snapshot, with this verb as the
+            // sync fallback path.
+            if (verb == "get_context")
+            {
+                json ctx = BuildContextSnapshot(bot, sess);
+                ctx["ok"]   = true;
+                ctx["verb"] = "get_context";
+                return ctx.dump();
+            }
 
             // set_agent_mode toggles whether the agent harness is
             // actively driving the bot. Default on attach: false

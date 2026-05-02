@@ -15,12 +15,15 @@
 #include "ObjectGuid.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace Sbywow::Bridge
 {
@@ -86,6 +89,19 @@ namespace Sbywow::Bridge
         bool   PopIntent(std::shared_ptr<PendingIntent>& out);
         size_t IntentCount() const;
 
+        // Snapshot the queue contents for the context block's
+        // active_intents projection. Returns a copy of {intentId, verb,
+        // intent kind name} for each queued intent, in queue order.
+        // The currently-suspended Wait intent is held in the engine,
+        // not the queue, so it's projected separately by the caller.
+        struct IntentView
+        {
+            uint64_t    intentId = 0;
+            std::string verb;
+            std::string kind;       // "move"|"interact"|"say"|"do_action"|"wait"
+        };
+        std::vector<IntentView> ProjectIntents() const;
+
         // Cancel-by-id: remove the matching intent from the queue if
         // present. Returns true on success, false if no queued intent
         // matches. On success, fills outVerb with the cancelled
@@ -129,6 +145,13 @@ namespace Sbywow::Bridge
         // "Agent mode is an explicit opt-in" for rationale.
         void   MarkAlive();
         int    HeartbeatAgeMs() const;
+
+        // Session uptime, monotonic since BotSession construction
+        // (roughly: since first attach for this guid this server-up
+        // cycle). steady_clock so we don't inherit getMSTime's
+        // uint32 wraparound. Surfaced as session.uptime_ms in the
+        // context block.
+        int64_t UptimeMs() const;
 
         // Agent mode. Explicitly opt-in: a freshly-attached bot
         // defaults to agent_mode=false, which means the bot behaves
@@ -182,6 +205,12 @@ namespace Sbywow::Bridge
         std::atomic<int64_t>                        lastAliveMs_{0};
         std::atomic<bool>                           agentMode_{false};
         std::atomic<bool>                           sseAttached_{false};
+
+        // Set in the constructor; read by UptimeMs() to compute
+        // session.uptime_ms in the context snapshot. steady_clock
+        // avoids the uint32 wrap that getMSTime() suffers from.
+        std::chrono::steady_clock::time_point       attachedAt_{
+            std::chrono::steady_clock::now()};
     };
 }
 

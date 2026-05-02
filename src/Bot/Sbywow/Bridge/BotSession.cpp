@@ -57,6 +57,28 @@ namespace Sbywow::Bridge
         return intents_.size();
     }
 
+    std::vector<BotSession::IntentView> BotSession::ProjectIntents() const
+    {
+        std::vector<IntentView> out;
+        std::lock_guard<std::mutex> lock(intentMutex_);
+        out.reserve(intents_.size());
+        for (auto const& p : intents_)
+        {
+            if (!p) continue;
+            char const* kindName = "unknown";
+            switch (p->intent.kind)
+            {
+                case Sbywow::IntentKind::Move:     kindName = "move";       break;
+                case Sbywow::IntentKind::Interact: kindName = "interact";   break;
+                case Sbywow::IntentKind::Say:      kindName = "say";        break;
+                case Sbywow::IntentKind::DoAction: kindName = "do_action";  break;
+                case Sbywow::IntentKind::Wait:     kindName = "wait";       break;
+            }
+            out.push_back(IntentView{ p->intentId, p->verb, kindName });
+        }
+        return out;
+    }
+
     bool BotSession::RemoveIntentById(uint64_t intentId, std::string& outVerb)
     {
         std::lock_guard<std::mutex> lock(intentMutex_);
@@ -134,5 +156,11 @@ namespace Sbywow::Bridge
         int64_t last = lastAliveMs_.load();
         int64_t now  = static_cast<int64_t>(getMSTime());
         return static_cast<int>(now - last);
+    }
+
+    int64_t BotSession::UptimeMs() const
+    {
+        auto delta = std::chrono::steady_clock::now() - attachedAt_;
+        return std::chrono::duration_cast<std::chrono::milliseconds>(delta).count();
     }
 }
