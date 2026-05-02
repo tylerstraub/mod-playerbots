@@ -3,11 +3,13 @@
 
 void AddSbywowMercenaryHooks();
 void AddSbywowMercCommands();
+void AddSC_SbywowBridgeScripts();
 
 void AddSC_SbywowMercenaryScripts()
 {
     AddSbywowMercenaryHooks();
     AddSbywowMercCommands();
+    AddSC_SbywowBridgeScripts();
 
     // EnsureServiceState() needs the DB ready. It will be wired into a
     // WorldScript bootstrap hook in a later step rather than called here.
