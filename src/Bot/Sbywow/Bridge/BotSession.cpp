@@ -35,6 +35,28 @@ namespace Sbywow::Bridge
         return true;
     }
 
+    void BotSession::PushIntent(std::shared_ptr<PendingIntent> pending)
+    {
+        std::lock_guard<std::mutex> lock(intentMutex_);
+        intents_.push_back(std::move(pending));
+    }
+
+    bool BotSession::PopIntent(std::shared_ptr<PendingIntent>& out)
+    {
+        std::lock_guard<std::mutex> lock(intentMutex_);
+        if (intents_.empty())
+            return false;
+        out = intents_.front();
+        intents_.pop_front();
+        return true;
+    }
+
+    size_t BotSession::IntentCount() const
+    {
+        std::lock_guard<std::mutex> lock(intentMutex_);
+        return intents_.size();
+    }
+
     void BotSession::PushOutbound(std::string eventJson)
     {
         {

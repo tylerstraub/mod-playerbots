@@ -11,6 +11,7 @@
 #ifndef _SBYWOW_BRIDGE_BOT_SESSION_H
 #define _SBYWOW_BRIDGE_BOT_SESSION_H
 
+#include "../AgentEngine/Intent.h"
 #include "ObjectGuid.h"
 
 #include <atomic>
@@ -38,6 +39,22 @@ namespace Sbywow::Bridge
         std::string json;
     };
 
+    // An agent-bonded engine intent awaiting execution. The HTTP
+    // handler — having received an intent verb (move_to today; more
+    // in Phase 3) — pushes one of these into the bot's intent queue.
+    // SbywowAgentEngine::DoNextAction pops one per tick, executes it,
+    // and sets the result promise. The HTTP handler's future is
+    // bound to that promise (moved out of the inbound PendingCommand
+    // when the verb dispatched), so the agent's HTTP call unblocks
+    // when the engine completes the intent — same external timing as
+    // synchronous verbs were before, just with the intent queue in
+    // the middle.
+    struct PendingIntent
+    {
+        Sbywow::Intent             intent;
+        std::promise<std::string>  result;
+    };
+
     class BotSession : public std::enable_shared_from_this<BotSession>
     {
     public:
@@ -54,6 +71,15 @@ namespace Sbywow::Bridge
         // drain pops with PopInbound.
         std::future<std::string> PushInbound(std::string commandJson);
         bool                     PopInbound(std::shared_ptr<PendingCommand>& out);
+
+        // Intent queue (TickBot dispatcher → SbywowAgentEngine). Bridge
+        // verb handlers translate intent verbs (move_to, etc.) into
+        // PendingIntent records and push here; engine's DoNextAction
+        // pops one per tick and executes. Lifecycle = bridge attach;
+        // queue is dropped on detach.
+        void   PushIntent(std::shared_ptr<PendingIntent> pending);
+        bool   PopIntent(std::shared_ptr<PendingIntent>& out);
+        size_t IntentCount() const;
 
         // Outbound (world → SSE). Push wakes the SSE writer; the writer
         // calls WaitOutbound which blocks until events arrive or timeout.
@@ -95,6 +121,9 @@ namespace Sbywow::Bridge
 
         std::mutex                                  inboundMutex_;
         std::deque<std::shared_ptr<PendingCommand>> inbound_;
+
+        mutable std::mutex                          intentMutex_;
+        std::deque<std::shared_ptr<PendingIntent>>  intents_;
 
         std::mutex                                  outboundMutex_;
         std::condition_variable                     outboundCv_;

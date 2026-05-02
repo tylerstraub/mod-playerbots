@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <utility>
@@ -315,10 +316,11 @@ namespace Sbywow::Bridge
             };
 
             json sessionInfo = {
-                {"heartbeat_ms",  sess.HeartbeatAgeMs()},
-                {"afk",           sess.IsAfk()},
-                {"sse_attached",  sess.IsSseAttached()},
-                {"seized",        sess.IsSeized()}
+                {"heartbeat_ms",   sess.HeartbeatAgeMs()},
+                {"afk",            sess.IsAfk()},
+                {"sse_attached",   sess.IsSseAttached()},
+                {"seized",         sess.IsSeized()},
+                {"intent_count",   static_cast<int>(sess.IntentCount())}
             };
 
             return json{
@@ -343,73 +345,41 @@ namespace Sbywow::Bridge
         // own opcode handlers and mod-playerbots' own actions use. None
         // touch upstream files. None require seize.
 
-        std::string DoMoveTo(Player* bot, json const& req)
+        // Build a Move intent from the move_to verb's JSON, queue it
+        // on the agent engine for execution next tick, and transfer
+        // the inbound PendingCommand's promise to the intent so the
+        // HTTP handler unblocks when the engine completes.
+        // Returns nullopt to signal "deferred" — TickBot's drain
+        // leaves the promise alone since the engine now owns it.
+        // Returns an immediate string for shape-validation errors —
+        // those don't need engine dispatch to diagnose.
+        std::optional<std::string> QueueMoveIntent(BotSession& sess,
+                                                   std::shared_ptr<PendingCommand>& cmd,
+                                                   json const& req)
         {
             if (!req.contains("x") || !req.contains("y") || !req.contains("z") ||
                 !req["x"].is_number() || !req["y"].is_number() || !req["z"].is_number())
                 return json{{"ok", false}, {"error", "move_to requires numeric x, y, z"}}.dump();
 
-            float x = req["x"].get<float>();
-            float y = req["y"].get<float>();
-            float z = req["z"].get<float>();
+            auto pending = std::make_shared<PendingIntent>();
+            pending->intent.kind = Sbywow::IntentKind::Move;
+            pending->intent.x = req["x"].get<float>();
+            pending->intent.y = req["y"].get<float>();
+            pending->intent.z = req["z"].get<float>();
+            if (req.contains("map") && !req["map"].is_null() && req["map"].is_number_unsigned())
+                pending->intent.map = req["map"].get<uint32_t>();
 
-            // Optional map id; if provided, must equal current. We do
-            // not teleport here — cross-map is a future verb that
-            // encodes the harder safety contract explicitly.
-            if (req.contains("map") && !req["map"].is_null())
-            {
-                uint32 reqMap = req["map"].get<uint32>();
-                if (reqMap != bot->GetMapId())
-                    return json{
-                        {"ok", false},
-                        {"error", "move_to: map mismatch (cross-map needs a teleport verb)"},
-                        {"requested_map", reqMap},
-                        {"current_map",   bot->GetMapId()}
-                    }.dump();
-            }
-
-            PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
-            if (!ai)
-                return json{{"ok", false}, {"error", "no PlayerbotAI for this bot"}}.dump();
-
-            // Use playerbots' canonical movement-allowed predicate.
-            // Covers dead, charmed, polymorphed, in-flight, being
-            // teleported, etc. — all the cases where issuing MovePoint
-            // would be wrong.
-            if (!ai->CanMove())
-                return json{{"ok", false}, {"error", "bot cannot move (dead/CC'd/in-flight)"}}.dump();
-
-            MotionMaster* mm = bot->GetMotionMaster();
-            if (!mm)
-                return json{{"ok", false}, {"error", "no motion master"}}.dump();
-
-            float fromX = bot->GetPositionX();
-            float fromY = bot->GetPositionY();
-            float fromZ = bot->GetPositionZ();
-            float dist  = bot->GetExactDist(x, y, z);
-
-            // Match mod-playerbots' MovementAction::DoMovePoint shape:
-            // stand up if sitting, then Clear() and MovePoint with
-            // generatePath=true so mmaps are honored. forceDestination
-            // false lets the spline engine refuse if the target is
-            // unreachable rather than teleport into geometry.
-            if (bot->IsSitState())
-                bot->SetStandState(UNIT_STAND_STATE_STAND);
-            mm->Clear();
-            mm->MovePoint(/*id*/ 0, x, y, z, FORCED_MOVEMENT_NONE,
-                          /*speed*/ 0.f, /*orientation*/ 0.f,
-                          /*generatePath*/ true,
-                          /*forceDestination*/ false);
-
-            return json{
-                {"ok",   true},
-                {"verb", "move_to"},
-                {"map",  bot->GetMapId()},
-                {"from", {fromX, fromY, fromZ}},
-                {"to",   {x, y, z}},
-                {"distance", dist}
-            }.dump();
+            // Transfer ownership of the inbound command's promise to
+            // the engine's pending intent. The HTTP-side future is
+            // bound to the same shared state, so set_value on the
+            // moved promise unblocks the HTTP response. After this
+            // move, cmd->result is in a moved-from state and must
+            // not be touched by the caller.
+            pending->result = std::move(cmd->result);
+            sess.PushIntent(std::move(pending));
+            return std::nullopt;  // deferred — engine will set the promise
         }
+
 
         // Decode a creature's npc_flags field into a small array of
         // human-readable role tags. The agent uses these to pick which
@@ -681,11 +651,17 @@ namespace Sbywow::Bridge
         // into a clean 503 instead of bringing down the realm. The
         // narrower per-verb wrappers (Save/Load) cover the highest-risk
         // sites first; this is belt-and-suspenders for the rest.
-        std::string DispatchCommandInner(Player* bot, BotSession& sess, std::string const& cmdJson);
+        // Returns nullopt if the verb was deferred to the engine
+        // (intent queued; engine will set the promise via the
+        // PendingIntent). Returns a string for sync verbs — caller
+        // sets it on the PendingCommand's promise.
+        std::optional<std::string> DispatchCommandInner(Player* bot, BotSession& sess,
+                                                        std::shared_ptr<PendingCommand>& cmd);
 
-        std::string DispatchCommand(Player* bot, BotSession& sess, std::string const& cmdJson)
+        std::optional<std::string> DispatchCommand(Player* bot, BotSession& sess,
+                                                   std::shared_ptr<PendingCommand>& cmd)
         {
-            try { return DispatchCommandInner(bot, sess, cmdJson); }
+            try { return DispatchCommandInner(bot, sess, cmd); }
             catch (std::exception const& e)
             {
                 json err = { {"ok", false}, {"error", std::string("dispatch threw: ") + e.what()} };
@@ -693,10 +669,11 @@ namespace Sbywow::Bridge
             }
         }
 
-        std::string DispatchCommandInner(Player* bot, BotSession& sess, std::string const& cmdJson)
+        std::optional<std::string> DispatchCommandInner(Player* bot, BotSession& sess,
+                                                        std::shared_ptr<PendingCommand>& cmd)
         {
             json req;
-            try { req = json::parse(cmdJson); }
+            try { req = json::parse(cmd->json); }
             catch (std::exception const& e)
             {
                 json err = { {"ok", false}, {"error", std::string("bad json: ") + e.what()} };
@@ -938,7 +915,7 @@ namespace Sbywow::Bridge
             // ---- Autonomous-driving primitives ------------------------
 
             if (verb == "move_to")
-                return DoMoveTo(bot, req);
+                return QueueMoveIntent(sess, cmd, req);
 
             if (verb == "find_nearby")
                 return DoFindNearby(bot, req);
@@ -1004,13 +981,22 @@ namespace Sbywow::Bridge
             return;
 
         // Drain inbound commands. Each command's promise is set with a
-        // result JSON the httplib handler is blocked on.
+        // result JSON the httplib handler is blocked on. Intent verbs
+        // (move_to today; more in Phase 3) defer — they move the
+        // promise into a PendingIntent on the bot's intent queue,
+        // and the SbywowAgentEngine sets the promise when it pops
+        // the intent next tick. DispatchCommand returns nullopt in
+        // that case; we leave the promise alone here.
         std::shared_ptr<PendingCommand> cmd;
         while (session->PopInbound(cmd))
         {
-            std::string out = DispatchCommand(bot, *session, cmd->json);
-            try { cmd->result.set_value(std::move(out)); }
-            catch (std::future_error const&) { /* receiver gone — ignore */ }
+            auto out = DispatchCommand(bot, *session, cmd);
+            if (out.has_value())
+            {
+                try { cmd->result.set_value(std::move(*out)); }
+                catch (std::future_error const&) { /* receiver gone */ }
+            }
+            // else: deferred — engine owns the promise now.
         }
 
         // AFK degradation. Heartbeat-driven for v1.

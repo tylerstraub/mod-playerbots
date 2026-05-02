@@ -11,24 +11,24 @@
  * replace the non-combat engine for agent-bonded bots" (2026-05-02).
  * Design: see docs/agent-engine-design.md.
  *
- * v1 scope (this file):
- *   - DoNextAction returns false unconditionally (no work).
- *   - Strategy state held to the single "default" strategy
- *     (WorldPacketHandlerStrategy) so packet-driven plumbing — accept
- *     loot, taxi confirm, group invite, gossip select-option dispatch —
- *     keeps working. None of those drive cognitive decisions.
- *   - One INFO log line on first tick for verification.
- *
- * v2 scope (next phase): drains an Intent queue from BotSession and
- * dispatches per-tick. v3+: reactive eat/drink autonomic.
+ * Phase 1: empty DoNextAction; strategy filter rejects all but
+ *          "default" so packet-handler plumbing survives.
+ * Phase 2 (this file): DoNextAction drains the per-bot Intent queue
+ *          (one per tick), dispatches by IntentKind, sets the
+ *          PendingIntent's promise so the HTTP-side verb returns.
+ * Phase 3+: reactive autonomic eat/drink, more intent kinds.
  */
 
 #ifndef _SBYWOW_AGENT_ENGINE_H
 #define _SBYWOW_AGENT_ENGINE_H
 
 #include "Engine.h"
+#include "Intent.h"
+
+#include <string>
 
 class AiObjectContext;
+class Player;
 class PlayerbotAI;
 class Unit;
 
@@ -49,7 +49,15 @@ namespace Sbywow
         // gets dropped silently. The agent harness owns those decisions.
         void addStrategy(std::string const name, bool init = true) override;
 
+        // Execute a single Intent against the bot. Returns the JSON
+        // string the HTTP-side verb will respond with. Public so the
+        // bridge can call it for synchronous unit testing if/when we
+        // want; primary call site is DoNextAction.
+        std::string ExecuteIntent(Player* bot, Intent const& intent);
+
     private:
+        std::string ExecuteMove(Player* bot, Intent const& intent);
+
         bool tickedOnce_ = false;
     };
 }
