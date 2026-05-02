@@ -922,12 +922,21 @@ namespace Sbywow::Bridge
                 return;
             }
 
-            // Push command, wait for world-thread to dispatch and return.
-            // Bound the wait so a hung tick doesn't pin the httplib thread
-            // forever. 5s is generous; commands run synchronously and
-            // should return within one tick (~50ms).
+            // Push command, wait for world-thread to *dispatch* and
+            // return. The timeout is a liveness guard against a wedged
+            // world thread, not an "execution budget." Sync verbs run
+            // entirely on the world thread and finish in <50ms typical
+            // (worst case ~500ms for find_nearby with a wide range).
+            // Intent verbs in the current sync-response model also
+            // resolve here when the engine completes the intent — but
+            // the upcoming async-via-events refactor (next-session
+            // target; see roadmap "Async intent contract") moves
+            // intent completion onto the SSE stream, leaving this
+            // timeout to cover only dispatch + sync-verb execution.
+            // 3s gives ~60 ticks of headroom for normal world-thread
+            // hiccups while surfacing genuine wedges quickly.
             auto fut = session->PushInbound(req.body);
-            if (fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout)
+            if (fut.wait_for(std::chrono::seconds(3)) == std::future_status::timeout)
             {
                 res.status = 504;
                 res.set_content(R"({"ok":false,"error":"world-thread timeout"})", "application/json");
