@@ -227,7 +227,26 @@ namespace Sbywow::Bridge
 
         // Translate a verb JSON into a result JSON. Runs on the world
         // thread, so any Playerbots API is fair game.
+        //
+        // Defense: top-level try/catch wraps every verb. A SIGSEGV from
+        // a Playerbots impl will still crash the world (incident
+        // 2026-05-02), but anything that throws a std::exception turns
+        // into a clean 503 instead of bringing down the realm. The
+        // narrower per-verb wrappers (Save/Load) cover the highest-risk
+        // sites first; this is belt-and-suspenders for the rest.
+        std::string DispatchCommandInner(Player* bot, BotSession& sess, std::string const& cmdJson);
+
         std::string DispatchCommand(Player* bot, BotSession& sess, std::string const& cmdJson)
+        {
+            try { return DispatchCommandInner(bot, sess, cmdJson); }
+            catch (std::exception const& e)
+            {
+                json err = { {"ok", false}, {"error", std::string("dispatch threw: ") + e.what()} };
+                return err.dump();
+            }
+        }
+
+        std::string DispatchCommandInner(Player* bot, BotSession& sess, std::string const& cmdJson)
         {
             json req;
             try { req = json::parse(cmdJson); }
@@ -410,34 +429,56 @@ namespace Sbywow::Bridge
 
                 if (verb == "get_value")
                 {
-                    // Format() is the human-display form; Save() is the
-                    // round-trippable form (inverse of Load). Many value
-                    // types override one but not the other, and both
-                    // default to "?" in UntypedValue. Return both so the
-                    // agent picks whichever is meaningful for the key.
+                    // CRITICAL: do NOT call Format(). Many overridden
+                    // Format() impls deref pointers (UnitCalculatedValue
+                    // calls Calculate()→Unit*, then Unit::GetName()) that
+                    // can be stale or null when the value is queried
+                    // outside its normal computation context. A SIGSEGV
+                    // on the world thread crashes the entire realm and
+                    // disconnects every player.
+                    //
+                    // Save() is much safer: default returns the literal
+                    // "?", overrides (RtiValue, PositionValue, Stances,
+                    // etc.) return stored primitive data without
+                    // dereferences. If Save returns "?", the value isn't
+                    // introspectable through this verb — that's the
+                    // honest signal to the agent. We additionally wrap
+                    // in try/catch for std::exception belt-and-suspenders;
+                    // it won't catch a segfault but covers anything that
+                    // throws a real C++ exception.
+                    //
+                    // Incident capture: 2026-05-02 in incidents.md.
+                    std::string saved;
+                    try { saved = uv->Save(); }
+                    catch (std::exception const& e) { saved = std::string("<save threw: ") + e.what() + ">"; }
                     return json{
-                        {"ok",     true},
-                        {"verb",   "get_value"},
-                        {"key",    key},
-                        {"format", uv->Format()},
-                        {"save",   uv->Save()}
+                        {"ok",   true},
+                        {"verb", "get_value"},
+                        {"key",  key},
+                        {"save", saved}
                     }.dump();
                 }
 
                 // set_value — UntypedValue::Load takes a string and
-                // returns true on success. Many value types don't
-                // override Load (returns false by default); honestly
-                // surface that to the agent so it knows the key is
-                // read-only via this generic path.
+                // returns true on success. Same crash-class risk as
+                // Format() (see incident 2026-05-02): a Load impl that
+                // dereferences stale pointers can segfault the world
+                // thread. Wrap in try/catch for std::exception (won't
+                // catch SIGSEGV but covers everything that throws).
                 std::string val = req.value("value", "");
-                bool loaded = uv->Load(val);
+                bool loaded = false;
+                std::string loadErr;
+                try { loaded = uv->Load(val); }
+                catch (std::exception const& e) { loadErr = std::string("load threw: ") + e.what(); }
                 json out = {
                     {"ok",    loaded},
                     {"verb",  "set_value"},
                     {"key",   key},
                     {"value", val}
                 };
-                if (!loaded)
+                if (!loadErr.empty())
+                    out["error"] = loadErr;
+                else if (!loaded)
                     out["error"] = "value type does not support Load() (read-only via set_value)";
                 return out.dump();
             }
