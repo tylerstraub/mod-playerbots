@@ -424,6 +424,20 @@ namespace Sbywow
         }.dump();
     }
 
+    bool SbywowAgentEngine::CancelWaitIfMatch(uint64_t intentId)
+    {
+        // Only match if we're actively suspended on this exact wait
+        // — a stale intent_id (e.g., a wait that already expired)
+        // shouldn't quietly clear the engine's idle bookkeeping.
+        if (!isWaiting_ || waitingIntentId_ != intentId)
+            return false;
+
+        isWaiting_ = false;
+        waitingIntentId_ = 0;
+        waitingIntentVerb_.clear();
+        return true;
+    }
+
     void SbywowAgentEngine::TickReactiveAutonomic(Player* bot)
     {
         // Throttle: cadence threshold ticks of idle before we even

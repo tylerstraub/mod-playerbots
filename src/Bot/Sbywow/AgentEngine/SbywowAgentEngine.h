@@ -56,6 +56,15 @@ namespace Sbywow
         // want; primary call site is DoNextAction.
         std::string ExecuteIntent(Player* bot, Intent const& intent);
 
+        // Cancellation hook: if the engine is currently suspended on
+        // a Wait intent matching this id, clear the suspension. The
+        // SSE intent_cancelled event is *not* emitted here — caller
+        // (bridge dispatcher) emits it once the cancel call returns
+        // true, so all cancel paths converge on a single emit site.
+        // Returns true if a wait was cleared, false if the engine
+        // wasn't waiting on this id.
+        bool CancelWaitIfMatch(uint64_t intentId);
+
     private:
         std::string ExecuteMove    (Player* bot, Intent const& intent);
         std::string ExecuteInteract(Player* bot, Intent const& intent);

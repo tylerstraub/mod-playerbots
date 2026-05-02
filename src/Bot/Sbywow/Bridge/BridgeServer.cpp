@@ -860,6 +860,66 @@ namespace Sbywow::Bridge
             if (verb == "wait")
                 return QueueWaitIntent(bot, sess, cmd, req);
 
+            // cancel_intent removes a queued intent or interrupts an
+            // in-flight Wait. Sub-tick intents (Move/Interact/Say/
+            // DoAction) that have already been popped have already
+            // emitted their terminal event by the time cancel sees
+            // them — we return ok=false in that case. See decisions.md
+            // "Async intent contract: cancellation scope narrowed"
+            // (2026-05-02) for the lifetime semantics.
+            if (verb == "cancel_intent")
+            {
+                std::string idStr = req.value("intent_id", "");
+                if (idStr.empty())
+                    return json{{"ok", false}, {"error", "cancel_intent requires intent_id"}}.dump();
+
+                uint64_t id = 0;
+                try { id = std::stoull(idStr); }
+                catch (...) { return json{{"ok", false}, {"error", "intent_id must be a uint64 string"}}.dump(); }
+
+                std::string cancelState;
+                if (sess.RemoveIntentById(id))
+                    cancelState = "from_queue";
+                else
+                {
+                    PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+                    Engine* nc = ai ? ai->GetEngine(BOT_STATE_NON_COMBAT) : nullptr;
+                    auto* agentEng = dynamic_cast<Sbywow::SbywowAgentEngine*>(nc);
+                    if (agentEng && agentEng->CancelWaitIfMatch(id))
+                        cancelState = "interrupted";
+                }
+
+                if (cancelState.empty())
+                    return json{
+                        {"ok", false},
+                        {"error", "intent_id not found (already terminal or never existed)"},
+                        {"intent_id", idStr}
+                    }.dump();
+
+                // Emit intent_cancelled. Verb is unknown at this
+                // point (we don't track it for cancelled-from-queue),
+                // so leave verb empty — consumers correlate by
+                // intent_id, the prior intent_queued event already
+                // told them the verb. state="from_queue"|"interrupted"
+                // is the only new info.
+                json ev = {
+                    {"channel",   "intent"},
+                    {"kind",      "intent_cancelled"},
+                    {"bot_guid",  bot->GetGUID().GetRawValue()},
+                    {"bot_name",  bot->GetName()},
+                    {"intent_id", idStr},
+                    {"state",     cancelState}
+                };
+                sess.PushOutbound(ev.dump());
+
+                return json{
+                    {"ok",        true},
+                    {"verb",      "cancel_intent"},
+                    {"intent_id", idStr},
+                    {"state",     cancelState}
+                }.dump();
+            }
+
             json err = { {"ok", false}, {"error", "unknown verb: " + verb} };
             return err.dump();
         }

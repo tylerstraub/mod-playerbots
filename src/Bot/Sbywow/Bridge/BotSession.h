@@ -85,6 +85,15 @@ namespace Sbywow::Bridge
         bool   PopIntent(std::shared_ptr<PendingIntent>& out);
         size_t IntentCount() const;
 
+        // Cancel-by-id: remove the matching intent from the queue if
+        // present. Returns true on success, false if no queued intent
+        // matches. Used by the cancel_intent verb. The companion
+        // case — cancelling a Wait intent that has already been
+        // popped and is suspending the engine — is handled inside
+        // SbywowAgentEngine::CancelWaitIfMatch, since that state
+        // lives on the engine, not the session.
+        bool   RemoveIntentById(uint64_t intentId);
+
         // Outbound (world → SSE). Push wakes the SSE writer; the writer
         // calls WaitOutbound which blocks until events arrive or timeout.
         void                     PushOutbound(std::string eventJson);

@@ -57,6 +57,20 @@ namespace Sbywow::Bridge
         return intents_.size();
     }
 
+    bool BotSession::RemoveIntentById(uint64_t intentId)
+    {
+        std::lock_guard<std::mutex> lock(intentMutex_);
+        for (auto it = intents_.begin(); it != intents_.end(); ++it)
+        {
+            if (*it && (*it)->intentId == intentId)
+            {
+                intents_.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
     void BotSession::PushOutbound(std::string eventJson)
     {
         {
