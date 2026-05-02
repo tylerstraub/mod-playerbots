@@ -101,6 +101,14 @@ public:
             return true;
         }
 
+        uint32 currentCount = sMercenaryMgr.GetMercCount(player->GetGUID());
+        if (currentCount >= Sbywow::MAX_MERCS_PER_OWNER)
+        {
+            handler->PSendSysMessage("You already have {} mercenaries (cap: {}). Dismiss one before hiring another.",
+                currentCount, Sbywow::MAX_MERCS_PER_OWNER);
+            return true;
+        }
+
         uint8 cls = ParseClassArg(arg);
         if (cls == 0)
         {
@@ -117,7 +125,7 @@ public:
 
         std::string mercName;
         sCharacterCache->GetCharacterNameByGuid(mercGuid, mercName);
-        handler->PSendSysMessage("Hired {} mercenary '{}' (guid={}). Log out and back in to summon.",
+        handler->PSendSysMessage("Hired {} mercenary '{}' (guid={}). Auto-summoned and joined your party.",
             ClassName(cls), mercName, mercGuid.GetCounter());
         return true;
     }
@@ -156,11 +164,31 @@ public:
         if (!player)
             return false;
 
-        std::string name = args ? args : "";
-        if (name.empty())
+        std::string raw = args ? args : "";
+        if (raw.empty())
         {
-            handler->SendSysMessage("Usage: .merc dismiss <name>");
+            handler->SendSysMessage("Usage: .merc dismiss <name> [force]");
             return true;
+        }
+
+        // Parse optional trailing 'force' keyword used to override the
+        // pending-mail guard. Mercs never auto-process mail (they always have
+        // a master, so CheckMailAction skips), and DismissMerc cascades through
+        // Player::DeleteFromDB which silently nukes the mail + items.
+        bool force = false;
+        std::string name = raw;
+        std::size_t space = raw.rfind(' ');
+        if (space != std::string::npos)
+        {
+            std::string tail = raw.substr(space + 1);
+            std::string tailLower = tail;
+            std::transform(tailLower.begin(), tailLower.end(), tailLower.begin(),
+                [](unsigned char c) { return std::tolower(c); });
+            if (tailLower == "force")
+            {
+                force = true;
+                name = raw.substr(0, space);
+            }
         }
 
         ObjectGuid mercGuid = sCharacterCache->GetCharacterGuidByName(name);
@@ -174,6 +202,19 @@ public:
         {
             handler->PSendSysMessage("'{}' is not one of your mercenaries.", name);
             return true;
+        }
+
+        if (!force)
+        {
+            QueryResult mailRes = CharacterDatabase.Query(
+                "SELECT COUNT(*) FROM mail WHERE receiver = {}", mercGuid.GetCounter());
+            uint32 mailCount = mailRes ? mailRes->Fetch()[0].Get<uint32>() : 0;
+            if (mailCount > 0)
+            {
+                handler->PSendSysMessage("'{}' has {} pending mail item(s) — they will be lost on dismiss.", name, mailCount);
+                handler->PSendSysMessage("Use '.merc dismiss {} force' to confirm.", name);
+                return true;
+            }
         }
 
         sMercenaryMgr.DismissMerc(mercGuid);

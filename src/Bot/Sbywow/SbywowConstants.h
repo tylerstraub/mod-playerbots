@@ -1,6 +1,8 @@
 #ifndef _SBYWOW_CONSTANTS_H
 #define _SBYWOW_CONSTANTS_H
 
+#include <cstdint>
+
 namespace Sbywow
 {
     // Dedicated service account that owns every mercenary character. Never
@@ -13,6 +15,11 @@ namespace Sbywow
     // immortal service character that itself lives on the service account.
     constexpr char const* MERCENARIES_GUILD_NAME = "Mercenaries";
     constexpr char const* GUILDMASTER_NAME       = "Guildmaster";
+
+    // Per-owner mercenary cap. Sized to allow a full 5-man (owner + 4 mercs)
+    // without filling every party slot, leaving room for one real player to
+    // join. Could become a config option later.
+    constexpr uint32 MAX_MERCS_PER_OWNER = 4;
 }
 
 #endif
