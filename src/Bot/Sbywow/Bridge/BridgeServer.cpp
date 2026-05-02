@@ -3,25 +3,38 @@
 #include "BotSession.h"
 
 #include "AiObjectContext.h"
+#include "Cell.h"
+#include "CellImpl.h"
 #include "Config.h"
+#include "Creature.h"
 #include "Engine.h"
+#include "GameObject.h"
+#include "GossipDef.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "Log.h"
+#include "MotionMaster.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "Value.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
 
 // Vendored single-header deps. Kept local to the bridge so we don't take
 // on a cross-module dependency on mod-playerbots-characters' deps tree.
 #include "deps/httplib.h"
 #include "deps/json.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <regex>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -223,6 +236,348 @@ namespace Sbywow::Bridge
                 }
             }
             return states;
+        }
+
+
+        // ---- Autonomous-driving primitives ------------------------
+        //
+        // Three verbs the agent uses to drive a mastered bot when the
+        // upstream rpg/grind subsystem is silently no-op'd by the
+        // !HasRealPlayerMaster() gates. See decisions.md
+        // "Master-bond suppresses roaming" for the architectural why.
+        //
+        // All three are pure additive Bucket 1 — they call existing
+        // public Player / WorldSession / MotionMaster surface that AC's
+        // own opcode handlers and mod-playerbots' own actions use. None
+        // touch upstream files. None require seize.
+
+        std::string DoMoveTo(Player* bot, json const& req)
+        {
+            if (!req.contains("x") || !req.contains("y") || !req.contains("z") ||
+                !req["x"].is_number() || !req["y"].is_number() || !req["z"].is_number())
+                return json{{"ok", false}, {"error", "move_to requires numeric x, y, z"}}.dump();
+
+            float x = req["x"].get<float>();
+            float y = req["y"].get<float>();
+            float z = req["z"].get<float>();
+
+            // Optional map id; if provided, must equal current. We do
+            // not teleport here — cross-map is a future verb that
+            // encodes the harder safety contract explicitly.
+            if (req.contains("map") && !req["map"].is_null())
+            {
+                uint32 reqMap = req["map"].get<uint32>();
+                if (reqMap != bot->GetMapId())
+                    return json{
+                        {"ok", false},
+                        {"error", "move_to: map mismatch (cross-map needs a teleport verb)"},
+                        {"requested_map", reqMap},
+                        {"current_map",   bot->GetMapId()}
+                    }.dump();
+            }
+
+            PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+            if (!ai)
+                return json{{"ok", false}, {"error", "no PlayerbotAI for this bot"}}.dump();
+
+            // Use playerbots' canonical movement-allowed predicate.
+            // Covers dead, charmed, polymorphed, in-flight, being
+            // teleported, etc. — all the cases where issuing MovePoint
+            // would be wrong.
+            if (!ai->CanMove())
+                return json{{"ok", false}, {"error", "bot cannot move (dead/CC'd/in-flight)"}}.dump();
+
+            MotionMaster* mm = bot->GetMotionMaster();
+            if (!mm)
+                return json{{"ok", false}, {"error", "no motion master"}}.dump();
+
+            float fromX = bot->GetPositionX();
+            float fromY = bot->GetPositionY();
+            float fromZ = bot->GetPositionZ();
+            float dist  = bot->GetExactDist(x, y, z);
+
+            // Match mod-playerbots' MovementAction::DoMovePoint shape:
+            // stand up if sitting, then Clear() and MovePoint with
+            // generatePath=true so mmaps are honored. forceDestination
+            // false lets the spline engine refuse if the target is
+            // unreachable rather than teleport into geometry.
+            if (bot->IsSitState())
+                bot->SetStandState(UNIT_STAND_STATE_STAND);
+            mm->Clear();
+            mm->MovePoint(/*id*/ 0, x, y, z, FORCED_MOVEMENT_NONE,
+                          /*speed*/ 0.f, /*orientation*/ 0.f,
+                          /*generatePath*/ true,
+                          /*forceDestination*/ false);
+
+            return json{
+                {"ok",   true},
+                {"verb", "move_to"},
+                {"map",  bot->GetMapId()},
+                {"from", {fromX, fromY, fromZ}},
+                {"to",   {x, y, z}},
+                {"distance", dist}
+            }.dump();
+        }
+
+        // Decode a creature's npc_flags field into a small array of
+        // human-readable role tags. The agent uses these to pick which
+        // follow-up verb to run (interact_with on a vendor, do_action
+        // "buy" on a vendor, etc.) without learning AC's bitfield.
+        json DecodeCreatureFlags(Creature const* c)
+        {
+            json flags = json::array();
+            if (c->IsGossip())          flags.push_back("gossip");
+            if (c->IsQuestGiver())      flags.push_back("questgiver");
+            if (c->IsTrainer())         flags.push_back("trainer");
+            if (c->IsVendor())          flags.push_back("vendor");
+            if (c->IsArmorer())         flags.push_back("repair");
+            if (c->IsTaxi())            flags.push_back("flightmaster");
+            if (c->IsBanker())          flags.push_back("banker");
+            if (c->IsInnkeeper())       flags.push_back("innkeeper");
+            if (c->IsAuctioner())       flags.push_back("auctioneer");
+            if (c->IsBattleMaster())    flags.push_back("battlemaster");
+            if (c->IsTabardDesigner())  flags.push_back("tabard");
+            if (c->IsSpiritHealer())    flags.push_back("spirithealer");
+            if (c->IsSpiritGuide())     flags.push_back("spiritguide");
+            if (c->HasNpcFlag(UNIT_NPC_FLAG_STABLEMASTER)) flags.push_back("stablemaster");
+            if (c->HasNpcFlag(UNIT_NPC_FLAG_MAILBOX))      flags.push_back("mailbox");
+            if (c->HasNpcFlag(UNIT_NPC_FLAG_GUILD_BANKER)) flags.push_back("guild_banker");
+            return flags;
+        }
+
+        std::string DoFindNearby(Player* bot, json const& req)
+        {
+            // Range default 30 yards, capped at 200 to keep the grid
+            // visit bounded. For comparison the player visibility range
+            // is ~100 yards on most maps; 200 is generous.
+            float range = req.contains("range") && req["range"].is_number()
+                          ? req["range"].get<float>() : 30.0f;
+            if (range < 0.f)   range = 0.f;
+            if (range > 200.f) range = 200.f;
+
+            bool wantCreatures = true, wantPlayers = true, wantGameObjects = true;
+            if (req.contains("kinds") && req["kinds"].is_array())
+            {
+                wantCreatures = wantPlayers = wantGameObjects = false;
+                for (auto const& kind : req["kinds"])
+                {
+                    if (!kind.is_string()) continue;
+                    std::string s = kind.get<std::string>();
+                    if      (s == "creature")   wantCreatures = true;
+                    else if (s == "player")     wantPlayers = true;
+                    else if (s == "gameobject") wantGameObjects = true;
+                }
+            }
+
+            int limit = req.contains("limit") && req["limit"].is_number()
+                        ? req["limit"].get<int>() : 50;
+            if (limit < 1)   limit = 1;
+            if (limit > 200) limit = 200;
+
+            bool aliveOnly = req.contains("alive_only") && req["alive_only"].is_boolean()
+                             ? req["alive_only"].get<bool>() : true;
+
+            PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+            Player* master = ai ? ai->GetMaster() : nullptr;
+
+            // Single grid visit collecting WorldObjects in range; we
+            // filter by kind below. AllWorldObjectsInRange honors
+            // phase, so cross-phase objects don't leak into perception.
+            std::list<WorldObject*> objs;
+            Acore::AllWorldObjectsInRange check(bot, range);
+            Acore::WorldObjectListSearcher<Acore::AllWorldObjectsInRange> searcher(bot, objs, check);
+            Cell::VisitObjects(bot, searcher, range);
+
+            // Pair items with their distance so we can sort by it,
+            // then truncate to limit before returning.
+            std::vector<std::pair<float, json>> scored;
+            scored.reserve(objs.size());
+
+            for (WorldObject* o : objs)
+            {
+                if (!o || o == bot) continue;
+
+                if (Creature* c = o->ToCreature())
+                {
+                    if (!wantCreatures) continue;
+                    if (aliveOnly && !c->IsAlive()) continue;
+                    float d = bot->GetExactDist(c);
+                    json item = {
+                        {"kind",    "creature"},
+                        {"guid",    c->GetGUID().GetRawValue()},
+                        {"entry",   c->GetEntry()},
+                        {"name",    c->GetName()},
+                        {"dist",    d},
+                        {"x",       c->GetPositionX()},
+                        {"y",       c->GetPositionY()},
+                        {"z",       c->GetPositionZ()},
+                        {"level",   c->GetLevel()},
+                        {"hp_pct",  static_cast<int>(c->GetHealthPct())},
+                        {"alive",   c->IsAlive()},
+                        {"hostile", c->IsHostileTo(bot)},
+                        {"flags",   DecodeCreatureFlags(c)}
+                    };
+                    scored.emplace_back(d, std::move(item));
+                }
+                else if (Player* p = o->ToPlayer())
+                {
+                    if (!wantPlayers) continue;
+                    if (aliveOnly && !p->IsAlive()) continue;
+                    float d = bot->GetExactDist(p);
+                    json item = {
+                        {"kind",      "player"},
+                        {"guid",      p->GetGUID().GetRawValue()},
+                        {"name",      p->GetName()},
+                        {"dist",      d},
+                        {"x",         p->GetPositionX()},
+                        {"y",         p->GetPositionY()},
+                        {"z",         p->GetPositionZ()},
+                        {"level",     p->GetLevel()},
+                        {"hp_pct",    static_cast<int>(p->GetHealthPct())},
+                        {"is_master", master == p},
+                        {"is_bot",    sPlayerbotsMgr.GetPlayerbotAI(p) != nullptr}
+                    };
+                    scored.emplace_back(d, std::move(item));
+                }
+                else if (GameObject* go = o->ToGameObject())
+                {
+                    if (!wantGameObjects) continue;
+                    float d = bot->GetExactDist(go);
+                    json item = {
+                        {"kind",    "gameobject"},
+                        {"guid",    go->GetGUID().GetRawValue()},
+                        {"entry",   go->GetEntry()},
+                        {"name",    go->GetName()},
+                        {"dist",    d},
+                        {"x",       go->GetPositionX()},
+                        {"y",       go->GetPositionY()},
+                        {"z",       go->GetPositionZ()},
+                        {"go_type", static_cast<int>(go->GetGoType())}
+                    };
+                    scored.emplace_back(d, std::move(item));
+                }
+            }
+
+            std::sort(scored.begin(), scored.end(),
+                      [](auto const& a, auto const& b) { return a.first < b.first; });
+
+            json arr = json::array();
+            int taken = 0;
+            for (auto& [d, item] : scored)
+            {
+                if (taken++ >= limit) break;
+                arr.push_back(std::move(item));
+            }
+
+            return json{
+                {"ok",      true},
+                {"verb",    "find_nearby"},
+                {"count",   arr.size()},
+                {"range",   range},
+                {"objects", arr}
+            }.dump();
+        }
+
+        std::string DoInteractWith(Player* bot, json const& req)
+        {
+            if (!req.contains("guid") || !req["guid"].is_number())
+                return json{{"ok", false}, {"error", "interact_with requires numeric guid"}}.dump();
+
+            uint64 raw = req["guid"].get<uint64>();
+            ObjectGuid og(raw);
+
+            if (!og.IsAnyTypeCreature())
+            {
+                if (og.IsGameObject())
+                    return json{{"ok", false},
+                                {"error", "interact_with: gameobjects not yet supported in v1"}}.dump();
+                return json{{"ok", false},
+                            {"error", "interact_with: guid is not a creature"}}.dump();
+            }
+
+            // GetNPCIfCanInteractWith is the same gate the chat-side
+            // gossip handlers use: bot's map, in interact range,
+            // visible, not in combat, faction-friendly. Returns nullptr
+            // if any of those fail. We pass UNIT_NPC_FLAG_NONE to mean
+            // "any flag" — we want to inspect what the NPC offers, not
+            // require it to match a specific role.
+            Creature* npc = bot->GetNPCIfCanInteractWith(og, UNIT_NPC_FLAG_NONE);
+            if (!npc)
+            {
+                // Diagnostic: is the creature on the bot's map at all?
+                // If yes, return its name + distance + alive state so
+                // the agent knows whether to walk closer or pick a
+                // different target. ObjectAccessor::GetCreature is
+                // bot's-map only, so it won't return cross-map ghosts.
+                if (Creature* c = ObjectAccessor::GetCreature(*bot, og))
+                    return json{
+                        {"ok",    false},
+                        {"error", "creature out of interact range or not visible"},
+                        {"name",  c->GetName()},
+                        {"dist",  bot->GetExactDist(c)},
+                        {"alive", c->IsAlive()}
+                    }.dump();
+                return json{{"ok", false},
+                            {"error", "creature not found on bot's map"}}.dump();
+            }
+
+            json out = {
+                {"ok",             true},
+                {"verb",           "interact_with"},
+                {"guid",           raw},
+                {"kind",           "creature"},
+                {"entry",          npc->GetEntry()},
+                {"name",           npc->GetName()},
+                {"flags",          DecodeCreatureFlags(npc)},
+                {"gossip_menu_id", npc->GetCreatureTemplate()->GossipMenuId},
+                {"dist",           bot->GetExactDist(npc)}
+            };
+
+            // Drive HandleGossipHelloOpcode through the bot's session —
+            // same path mod-playerbots' GossipHelloAction takes for
+            // every bot gossip interaction. Populates PlayerTalkClass
+            // with the menu items and runs OnGossipHello script
+            // callbacks. Wrapped in try/catch for std::exception
+            // (won't catch a segfault, but the call site is
+            // identical to the in-game player path so safety is at
+            // parity with normal play).
+            bool gossipOpened = false;
+            std::string gossipError;
+            try
+            {
+                WorldPacket data;
+                data << og;
+                bot->GetSession()->HandleGossipHelloOpcode(data);
+                gossipOpened = true;
+            }
+            catch (std::exception const& e)
+            {
+                gossipError = std::string("gossip_hello threw: ") + e.what();
+            }
+            out["gossip_opened"] = gossipOpened;
+            if (!gossipError.empty())
+                out["gossip_error"] = gossipError;
+
+            // Read back the populated gossip menu, if any, so the
+            // agent can pick an option without knowing the NPC's
+            // gossip schema in advance.
+            if (gossipOpened && bot->PlayerTalkClass)
+            {
+                json gossipOpts = json::array();
+                GossipMenu& menu = bot->PlayerTalkClass->GetGossipMenu();
+                for (auto const& [idx, item] : menu.GetMenuItems())
+                {
+                    gossipOpts.push_back({
+                        {"index", idx},
+                        {"icon",  static_cast<int>(item.MenuItemIcon)},
+                        {"text",  item.Message}
+                    });
+                }
+                out["gossip_options"] = gossipOpts;
+                out["gossip_menu_open_id"] = menu.GetMenuId();
+            }
+
+            return out.dump();
         }
 
         // Translate a verb JSON into a result JSON. Runs on the world
@@ -482,6 +837,17 @@ namespace Sbywow::Bridge
                     out["error"] = "value type does not support Load() (read-only via set_value)";
                 return out.dump();
             }
+
+            // ---- Autonomous-driving primitives ------------------------
+
+            if (verb == "move_to")
+                return DoMoveTo(bot, req);
+
+            if (verb == "find_nearby")
+                return DoFindNearby(bot, req);
+
+            if (verb == "interact_with")
+                return DoInteractWith(bot, req);
 
             // ---- Chat / say -------------------------------------------
 
