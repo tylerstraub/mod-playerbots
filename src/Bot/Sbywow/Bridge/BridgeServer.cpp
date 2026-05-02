@@ -135,7 +135,9 @@ namespace Sbywow::Bridge
         if (sessions_.find(key) != sessions_.end())
             return false;
 
-        sessions_[key] = std::make_shared<BotSession>(bot->GetGUID());
+        auto session = std::make_shared<BotSession>(bot->GetGUID());
+        session->SetName(bot->GetName());
+        sessions_[key] = session;
         LOG_INFO("server.loading", "[SbywowBridge] attached bot guid={} name={}",
                  key, bot->GetName());
         return true;
@@ -660,6 +662,7 @@ namespace Sbywow::Bridge
                 {
                     arr.push_back({
                         {"guid",            key},
+                        {"name",            sess->Name()},
                         {"heartbeat_ms",    sess->HeartbeatAgeMs()},
                         {"afk",             sess->IsAfk()},
                         {"sse_attached",    sess->IsSseAttached()},

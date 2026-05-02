@@ -45,6 +45,11 @@ namespace Sbywow::Bridge
 
         ObjectGuid Guid() const { return guid_; }
 
+        // Cached bot name for cheap CLI name→guid lookup. Set on attach
+        // when we have the Player*; immutable for the session lifetime.
+        std::string const& Name() const { return name_; }
+        void SetName(std::string const& n) { name_ = n; }
+
         // Inbound (httplib → world). Push returns the future; world-thread
         // drain pops with PopInbound.
         std::future<std::string> PushInbound(std::string commandJson);
@@ -86,6 +91,7 @@ namespace Sbywow::Bridge
 
     private:
         ObjectGuid                                  guid_;
+        std::string                                 name_;
 
         std::mutex                                  inboundMutex_;
         std::deque<std::shared_ptr<PendingCommand>> inbound_;
