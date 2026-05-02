@@ -20,6 +20,7 @@ public:
     SbywowMercenaryPlayerScript() : PlayerScript("SbywowMercenaryPlayerScript", {
         PLAYERHOOK_ON_LEVEL_CHANGED,
         PLAYERHOOK_ON_DELETE,
+        PLAYERHOOK_ON_DELETE_FROM_DB,
         PLAYERHOOK_ON_MAP_CHANGED
     }) {}
 
@@ -128,18 +129,34 @@ public:
 
     void OnPlayerDelete(ObjectGuid guid, uint32 /*accountId*/) override
     {
-        // Fires BEFORE Player::DeleteFromDB runs, so it's safe to enumerate
-        // owned mercs and dismiss them — DismissMerc cascades each merc through
-        // its own DeleteFromDB on the service account.
+        // Player char-select delete path. Fires BEFORE Player::DeleteFromDB
+        // runs, so it's safe to enumerate owned mercs and dismiss them —
+        // DismissMerc cascades each merc through its own DeleteFromDB on the
+        // service account. NOTE: this hook does NOT fire for GM `.character
+        // erase`; that path triggers OnPlayerDeleteFromDB instead. For GM
+        // erase of an owner-with-mercs, the merc characters are orphaned on
+        // the service account until orphan reaper sweep 1 catches them
+        // (cleanup happens at next restart or via `.merc admin reap`).
         std::vector<ObjectGuid> owned = sMercenaryMgr.GetMercsForOwner(guid);
         for (ObjectGuid mercGuid : owned)
             sMercenaryMgr.DismissMerc(mercGuid);
+    }
 
-        // Also handle the inverse: if a service-account merc character is
-        // deleted directly (GM .character delete or our .merc admin nuke), drop
-        // its ownership row. RemoveOwnership is idempotent and a no-op for
-        // non-merc guids, so we can call unconditionally.
-        sMercenaryMgr.RemoveOwnership(guid);
+    void OnPlayerDeleteFromDB(CharacterDatabaseTransaction trans, uint32 guid) override
+    {
+        // Fires INSIDE Player::DeleteFromDB's transaction for any path that
+        // hits the full CHAR_DELETE_REMOVE branch — covers `.character erase`,
+        // `.merc admin nuke`, char-select delete, etc. We append the
+        // ownership-row removal to the same transaction so the cleanup is
+        // atomic with the character deletion.
+        //
+        // Idempotent for non-merc guids (DELETE WHERE returns zero rows).
+        // We deliberately do NOT also delete rows where this guid is the
+        // OWNER — that would orphan the merc characters on the service
+        // account without dismissing them (DismissMerc would be reentrant
+        // inside this transaction). Owner-side cascade lives in
+        // OnPlayerDelete + the orphan reaper as the safety net.
+        trans->Append("DELETE FROM mod_sbywow_mercenaries WHERE merc_guid = {}", guid);
     }
 };
 
