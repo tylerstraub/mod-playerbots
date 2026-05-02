@@ -25,6 +25,7 @@
 #include "Engine.h"
 #include "Intent.h"
 
+#include <chrono>
 #include <string>
 
 class AiObjectContext;
@@ -56,9 +57,20 @@ namespace Sbywow
         std::string ExecuteIntent(Player* bot, Intent const& intent);
 
     private:
-        std::string ExecuteMove(Player* bot, Intent const& intent);
+        std::string ExecuteMove    (Player* bot, Intent const& intent);
+        std::string ExecuteInteract(Player* bot, Intent const& intent);
+        std::string ExecuteSay     (Player* bot, Intent const& intent);
+        std::string ExecuteDoAction(Player* bot, Intent const& intent);
+        // Wait is handled in DoNextAction directly (engine state) —
+        // it doesn't run synchronously like the other intents; it
+        // suspends queue draining for its duration.
 
-        bool tickedOnce_ = false;
+        bool                                   tickedOnce_  = false;
+        // Engaged means the engine is in a wait-suspension; no
+        // intents are popped until steady_clock::now() >= waitUntil_.
+        // steady_clock so we avoid getMSTime's uint32 wraparound.
+        bool                                   isWaiting_   = false;
+        std::chrono::steady_clock::time_point  waitUntil_;
     };
 }
 

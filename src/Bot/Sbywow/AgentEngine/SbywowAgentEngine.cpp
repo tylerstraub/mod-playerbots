@@ -4,12 +4,18 @@
 #include "../Bridge/BotSession.h"
 #include "../Bridge/deps/json.hpp"
 
+#include "Creature.h"
+#include "Event.h"
+#include "GossipDef.h"
 #include "Log.h"
 #include "MotionMaster.h"
+#include "ObjectAccessor.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
 
 using json = nlohmann::json;
 
@@ -77,6 +83,21 @@ namespace Sbywow
                      bot->GetGUID().GetRawValue(), bot->GetName().c_str());
         }
 
+        // Wait suspension: while engaged, no intents drain. Wait is
+        // explicit agent-issued sequencing — "do A, hold for N ms,
+        // then do B" — implemented as a pause on intent dispatch.
+        // The Wait intent's promise is set at *start* of suspension
+        // (so the agent's HTTP call returns immediately with "queued
+        // for N ms"), and chained intents queue behind it until
+        // suspension lifts. Uses steady_clock to avoid getMSTime's
+        // uint32 wraparound — small bug but free to avoid.
+        if (isWaiting_)
+        {
+            if (std::chrono::steady_clock::now() < waitUntil_)
+                return false;  // still waiting
+            isWaiting_ = false;
+        }
+
         // Pop one intent per tick from the per-bot session queue,
         // execute it, set the promise so the HTTP-side verb returns.
         // BridgeServer is the canonical owner of sessions; if the
@@ -90,6 +111,24 @@ namespace Sbywow
         if (!session->PopIntent(pending))
             return false;
 
+        // Wait is special-cased: arm the suspension and respond
+        // immediately. Subsequent intents in the queue wait their
+        // turn until suspension lifts in a future tick.
+        if (pending->intent.kind == IntentKind::Wait)
+        {
+            isWaiting_ = true;
+            waitUntil_ = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(pending->intent.waitMs);
+            json out = {
+                {"ok",       true},
+                {"verb",     "wait"},
+                {"wait_ms",  pending->intent.waitMs}
+            };
+            try { pending->result.set_value(out.dump()); }
+            catch (std::future_error const&) {}
+            return true;
+        }
+
         std::string out = ExecuteIntent(bot, pending->intent);
         try { pending->result.set_value(std::move(out)); }
         catch (std::future_error const&) { /* receiver gone — drop */ }
@@ -101,8 +140,14 @@ namespace Sbywow
     {
         switch (intent.kind)
         {
-            case IntentKind::Move:
-                return ExecuteMove(bot, intent);
+            case IntentKind::Move:     return ExecuteMove    (bot, intent);
+            case IntentKind::Interact: return ExecuteInteract(bot, intent);
+            case IntentKind::Say:      return ExecuteSay     (bot, intent);
+            case IntentKind::DoAction: return ExecuteDoAction(bot, intent);
+            case IntentKind::Wait:
+                // Wait is handled in DoNextAction directly (engine
+                // state); should never reach this dispatcher.
+                return json{{"ok", false}, {"error", "wait reached ExecuteIntent — bug"}}.dump();
         }
         return json{{"ok", false}, {"error", "unknown intent kind"}}.dump();
     }
@@ -160,6 +205,162 @@ namespace Sbywow
             {"from",     {fromX, fromY, fromZ}},
             {"to",       {intent.x, intent.y, intent.z}},
             {"distance", dist}
+        }.dump();
+    }
+
+    namespace
+    {
+        // Decode a creature's npc_flags into role tags. Same shape as
+        // bridge's find_nearby uses; duplicated here to keep the engine
+        // independent of bridge internals. If we ever want one source
+        // of truth, lift to a shared helper file.
+        json DecodeCreatureFlags(Creature const* c)
+        {
+            json flags = json::array();
+            if (c->IsGossip())          flags.push_back("gossip");
+            if (c->IsQuestGiver())      flags.push_back("questgiver");
+            if (c->IsTrainer())         flags.push_back("trainer");
+            if (c->IsVendor())          flags.push_back("vendor");
+            if (c->IsArmorer())         flags.push_back("repair");
+            if (c->IsTaxi())            flags.push_back("flightmaster");
+            if (c->IsBanker())          flags.push_back("banker");
+            if (c->IsInnkeeper())       flags.push_back("innkeeper");
+            if (c->IsAuctioner())       flags.push_back("auctioneer");
+            if (c->IsBattleMaster())    flags.push_back("battlemaster");
+            if (c->IsTabardDesigner())  flags.push_back("tabard");
+            if (c->IsSpiritHealer())    flags.push_back("spirithealer");
+            if (c->IsSpiritGuide())     flags.push_back("spiritguide");
+            if (c->HasNpcFlag(UNIT_NPC_FLAG_STABLEMASTER)) flags.push_back("stablemaster");
+            if (c->HasNpcFlag(UNIT_NPC_FLAG_MAILBOX))      flags.push_back("mailbox");
+            if (c->HasNpcFlag(UNIT_NPC_FLAG_GUILD_BANKER)) flags.push_back("guild_banker");
+            return flags;
+        }
+    }
+
+    std::string SbywowAgentEngine::ExecuteInteract(Player* bot, Intent const& intent)
+    {
+        ObjectGuid og(intent.guid);
+        if (!og.IsAnyTypeCreature())
+        {
+            if (og.IsGameObject())
+                return json{{"ok", false},
+                            {"error", "interact: gameobjects not yet supported"}}.dump();
+            return json{{"ok", false},
+                        {"error", "interact: guid is not a creature"}}.dump();
+        }
+
+        Creature* npc = bot->GetNPCIfCanInteractWith(og, UNIT_NPC_FLAG_NONE);
+        if (!npc)
+        {
+            if (Creature* c = ObjectAccessor::GetCreature(*bot, og))
+                return json{
+                    {"ok",    false},
+                    {"error", "creature out of interact range or not visible"},
+                    {"name",  c->GetName()},
+                    {"dist",  bot->GetExactDist(c)},
+                    {"alive", c->IsAlive()}
+                }.dump();
+            return json{{"ok", false}, {"error", "creature not found on bot's map"}}.dump();
+        }
+
+        json out = {
+            {"ok",             true},
+            {"verb",           "interact_with"},
+            {"guid",           intent.guid},
+            {"kind",           "creature"},
+            {"entry",          npc->GetEntry()},
+            {"name",           npc->GetName()},
+            {"flags",          DecodeCreatureFlags(npc)},
+            {"gossip_menu_id", npc->GetCreatureTemplate()->GossipMenuId},
+            {"dist",           bot->GetExactDist(npc)}
+        };
+
+        // Drive HandleGossipHelloOpcode through the bot's session.
+        // Mirrors GossipHelloAction's path; safe under same conditions
+        // mod-playerbots invokes it routinely.
+        bool gossipOpened = false;
+        std::string gossipError;
+        try
+        {
+            WorldPacket data;
+            data << og;
+            bot->GetSession()->HandleGossipHelloOpcode(data);
+            gossipOpened = true;
+        }
+        catch (std::exception const& e)
+        {
+            gossipError = std::string("gossip_hello threw: ") + e.what();
+        }
+        out["gossip_opened"] = gossipOpened;
+        if (!gossipError.empty())
+            out["gossip_error"] = gossipError;
+
+        if (gossipOpened && bot->PlayerTalkClass)
+        {
+            json gossipOpts = json::array();
+            GossipMenu& menu = bot->PlayerTalkClass->GetGossipMenu();
+            for (auto const& [idx, item] : menu.GetMenuItems())
+            {
+                gossipOpts.push_back({
+                    {"index", idx},
+                    {"icon",  static_cast<int>(item.MenuItemIcon)},
+                    {"text",  item.Message}
+                });
+            }
+            out["gossip_options"] = gossipOpts;
+            out["gossip_menu_open_id"] = menu.GetMenuId();
+        }
+
+        return out.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteSay(Player* bot, Intent const& intent)
+    {
+        PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (!ai)
+            return json{{"ok", false}, {"error", "no PlayerbotAI for this bot"}}.dump();
+
+        bool ok = false;
+        if      (intent.channel == "say"   || intent.channel.empty()) ok = ai->Say(intent.text);
+        else if (intent.channel == "yell")    ok = ai->Yell(intent.text);
+        else if (intent.channel == "party")   ok = ai->SayToParty(intent.text);
+        else if (intent.channel == "raid")    ok = ai->SayToRaid(intent.text);
+        else if (intent.channel == "guild")   ok = ai->SayToGuild(intent.text);
+        else if (intent.channel == "world")   ok = ai->SayToWorld(intent.text);
+        else if (intent.channel == "master")  ok = ai->TellMaster(intent.text);
+        else
+        {
+            return json{
+                {"ok", false},
+                {"error", "unknown channel: " + intent.channel +
+                          " (say|yell|party|raid|guild|world|master)"}
+            }.dump();
+        }
+
+        return json{
+            {"ok",      ok},
+            {"verb",    "say"},
+            {"channel", intent.channel.empty() ? "say" : intent.channel},
+            {"text",    intent.text}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteDoAction(Player* bot, Intent const& intent)
+    {
+        PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (!ai)
+            return json{{"ok", false}, {"error", "no PlayerbotAI for this bot"}}.dump();
+
+        Event ev;
+        bool result = ai->DoSpecificAction(intent.actionName, ev,
+                                           /*silent=*/true,
+                                           intent.actionQualifier);
+
+        return json{
+            {"ok",        result},
+            {"verb",      "do_action"},
+            {"name",      intent.actionName},
+            {"qualifier", intent.actionQualifier}
         }.dump();
     }
 }

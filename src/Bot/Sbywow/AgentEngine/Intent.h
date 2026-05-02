@@ -24,18 +24,35 @@ namespace Sbywow
     enum class IntentKind : uint8_t
     {
         Move,
-        // Phase 3 will add: Interact, Say, DoAction, Wait
+        Interact,
+        Say,
+        DoAction,
+        Wait,
     };
 
     struct Intent
     {
         IntentKind kind = IntentKind::Move;
 
-        // Move fields. Map 0 means "no constraint" (use bot's current).
-        float  x   = 0.f;
-        float  y   = 0.f;
-        float  z   = 0.f;
-        uint32_t map = 0;
+        // Move:
+        float    x    = 0.f;
+        float    y    = 0.f;
+        float    z    = 0.f;
+        uint32_t map  = 0;       // 0 = no constraint
+
+        // Interact:
+        uint64_t guid = 0;       // target object guid
+
+        // Say:
+        std::string text;
+        std::string channel;     // "say"|"yell"|"party"|"raid"|"guild"|"world"|"master"
+
+        // DoAction:
+        std::string actionName;
+        std::string actionQualifier;
+
+        // Wait:
+        uint32_t waitMs = 0;
     };
 }
 

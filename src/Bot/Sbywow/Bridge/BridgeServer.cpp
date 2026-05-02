@@ -189,20 +189,6 @@ namespace Sbywow::Bridge
 
     namespace
     {
-        // Push a control-channel event onto the bot's outbound queue so
-        // the agent's SSE stream sees state transitions it didn't
-        // request directly (e.g., heartbeat-driven force-release).
-        void EmitControlEvent(BotSession& sess, std::string const& kind, std::string const& reason)
-        {
-            json ev = {
-                {"channel",  "control"},
-                {"kind",     kind},
-                {"bot_guid", sess.Guid().GetRawValue()},
-                {"reason",   reason}
-            };
-            sess.PushOutbound(ev.dump());
-        }
-
         // Resolve string state name to BotState, or -1 for "all".
         // Returns -2 on invalid name. Default mapping if absent: non-combat.
         int ParseBotState(std::string const& s)
@@ -319,7 +305,6 @@ namespace Sbywow::Bridge
                 {"heartbeat_ms",   sess.HeartbeatAgeMs()},
                 {"afk",            sess.IsAfk()},
                 {"sse_attached",   sess.IsSseAttached()},
-                {"seized",         sess.IsSeized()},
                 {"intent_count",   static_cast<int>(sess.IntentCount())}
             };
 
@@ -345,14 +330,25 @@ namespace Sbywow::Bridge
         // own opcode handlers and mod-playerbots' own actions use. None
         // touch upstream files. None require seize.
 
-        // Build a Move intent from the move_to verb's JSON, queue it
-        // on the agent engine for execution next tick, and transfer
-        // the inbound PendingCommand's promise to the intent so the
-        // HTTP handler unblocks when the engine completes.
-        // Returns nullopt to signal "deferred" — TickBot's drain
-        // leaves the promise alone since the engine now owns it.
-        // Returns an immediate string for shape-validation errors —
-        // those don't need engine dispatch to diagnose.
+        // Defer a verb to the engine: package the intent into a
+        // PendingIntent, transfer the inbound PendingCommand's
+        // promise into it (HTTP-side future stays bound to the
+        // same shared state — set_value on the moved promise
+        // unblocks the HTTP response), push to the session's
+        // intent queue, and signal "deferred" to the caller.
+        // After this move, cmd->result is in a moved-from state
+        // and must not be touched.
+        std::optional<std::string> Defer(BotSession& sess,
+                                         std::shared_ptr<PendingCommand>& cmd,
+                                         Sbywow::Intent intent)
+        {
+            auto pending = std::make_shared<PendingIntent>();
+            pending->intent = std::move(intent);
+            pending->result = std::move(cmd->result);
+            sess.PushIntent(std::move(pending));
+            return std::nullopt;
+        }
+
         std::optional<std::string> QueueMoveIntent(BotSession& sess,
                                                    std::shared_ptr<PendingCommand>& cmd,
                                                    json const& req)
@@ -361,23 +357,75 @@ namespace Sbywow::Bridge
                 !req["x"].is_number() || !req["y"].is_number() || !req["z"].is_number())
                 return json{{"ok", false}, {"error", "move_to requires numeric x, y, z"}}.dump();
 
-            auto pending = std::make_shared<PendingIntent>();
-            pending->intent.kind = Sbywow::IntentKind::Move;
-            pending->intent.x = req["x"].get<float>();
-            pending->intent.y = req["y"].get<float>();
-            pending->intent.z = req["z"].get<float>();
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::Move;
+            i.x = req["x"].get<float>();
+            i.y = req["y"].get<float>();
+            i.z = req["z"].get<float>();
             if (req.contains("map") && !req["map"].is_null() && req["map"].is_number_unsigned())
-                pending->intent.map = req["map"].get<uint32_t>();
+                i.map = req["map"].get<uint32_t>();
+            return Defer(sess, cmd, std::move(i));
+        }
 
-            // Transfer ownership of the inbound command's promise to
-            // the engine's pending intent. The HTTP-side future is
-            // bound to the same shared state, so set_value on the
-            // moved promise unblocks the HTTP response. After this
-            // move, cmd->result is in a moved-from state and must
-            // not be touched by the caller.
-            pending->result = std::move(cmd->result);
-            sess.PushIntent(std::move(pending));
-            return std::nullopt;  // deferred — engine will set the promise
+        std::optional<std::string> QueueInteractIntent(BotSession& sess,
+                                                       std::shared_ptr<PendingCommand>& cmd,
+                                                       json const& req)
+        {
+            if (!req.contains("guid") || !req["guid"].is_number())
+                return json{{"ok", false}, {"error", "interact_with requires numeric guid"}}.dump();
+
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::Interact;
+            i.guid = req["guid"].get<uint64_t>();
+            return Defer(sess, cmd, std::move(i));
+        }
+
+        std::optional<std::string> QueueSayIntent(BotSession& sess,
+                                                  std::shared_ptr<PendingCommand>& cmd,
+                                                  json const& req)
+        {
+            std::string text = req.value("text", "");
+            if (text.empty())
+                return json{{"ok", false}, {"error", "say requires text"}}.dump();
+
+            Sbywow::Intent i;
+            i.kind    = Sbywow::IntentKind::Say;
+            i.text    = std::move(text);
+            i.channel = req.value("channel", "say");
+            return Defer(sess, cmd, std::move(i));
+        }
+
+        std::optional<std::string> QueueDoActionIntent(BotSession& sess,
+                                                       std::shared_ptr<PendingCommand>& cmd,
+                                                       json const& req)
+        {
+            std::string name = req.value("name", "");
+            if (name.empty())
+                return json{{"ok", false}, {"error", "do_action requires name"}}.dump();
+
+            Sbywow::Intent i;
+            i.kind            = Sbywow::IntentKind::DoAction;
+            i.actionName      = std::move(name);
+            i.actionQualifier = req.value("qualifier", "");
+            return Defer(sess, cmd, std::move(i));
+        }
+
+        std::optional<std::string> QueueWaitIntent(BotSession& sess,
+                                                   std::shared_ptr<PendingCommand>& cmd,
+                                                   json const& req)
+        {
+            if (!req.contains("ms") || !req["ms"].is_number_unsigned())
+                return json{{"ok", false}, {"error", "wait requires unsigned ms"}}.dump();
+
+            uint32_t ms = req["ms"].get<uint32_t>();
+            // Cap at 60s to keep agent harness round-trips bounded;
+            // longer pauses can be chained by the harness.
+            if (ms > 60000) ms = 60000;
+
+            Sbywow::Intent i;
+            i.kind   = Sbywow::IntentKind::Wait;
+            i.waitMs = ms;
+            return Defer(sess, cmd, std::move(i));
         }
 
 
@@ -540,107 +588,6 @@ namespace Sbywow::Bridge
             }.dump();
         }
 
-        std::string DoInteractWith(Player* bot, json const& req)
-        {
-            if (!req.contains("guid") || !req["guid"].is_number())
-                return json{{"ok", false}, {"error", "interact_with requires numeric guid"}}.dump();
-
-            uint64 raw = req["guid"].get<uint64>();
-            ObjectGuid og(raw);
-
-            if (!og.IsAnyTypeCreature())
-            {
-                if (og.IsGameObject())
-                    return json{{"ok", false},
-                                {"error", "interact_with: gameobjects not yet supported in v1"}}.dump();
-                return json{{"ok", false},
-                            {"error", "interact_with: guid is not a creature"}}.dump();
-            }
-
-            // GetNPCIfCanInteractWith is the same gate the chat-side
-            // gossip handlers use: bot's map, in interact range,
-            // visible, not in combat, faction-friendly. Returns nullptr
-            // if any of those fail. We pass UNIT_NPC_FLAG_NONE to mean
-            // "any flag" — we want to inspect what the NPC offers, not
-            // require it to match a specific role.
-            Creature* npc = bot->GetNPCIfCanInteractWith(og, UNIT_NPC_FLAG_NONE);
-            if (!npc)
-            {
-                // Diagnostic: is the creature on the bot's map at all?
-                // If yes, return its name + distance + alive state so
-                // the agent knows whether to walk closer or pick a
-                // different target. ObjectAccessor::GetCreature is
-                // bot's-map only, so it won't return cross-map ghosts.
-                if (Creature* c = ObjectAccessor::GetCreature(*bot, og))
-                    return json{
-                        {"ok",    false},
-                        {"error", "creature out of interact range or not visible"},
-                        {"name",  c->GetName()},
-                        {"dist",  bot->GetExactDist(c)},
-                        {"alive", c->IsAlive()}
-                    }.dump();
-                return json{{"ok", false},
-                            {"error", "creature not found on bot's map"}}.dump();
-            }
-
-            json out = {
-                {"ok",             true},
-                {"verb",           "interact_with"},
-                {"guid",           raw},
-                {"kind",           "creature"},
-                {"entry",          npc->GetEntry()},
-                {"name",           npc->GetName()},
-                {"flags",          DecodeCreatureFlags(npc)},
-                {"gossip_menu_id", npc->GetCreatureTemplate()->GossipMenuId},
-                {"dist",           bot->GetExactDist(npc)}
-            };
-
-            // Drive HandleGossipHelloOpcode through the bot's session —
-            // same path mod-playerbots' GossipHelloAction takes for
-            // every bot gossip interaction. Populates PlayerTalkClass
-            // with the menu items and runs OnGossipHello script
-            // callbacks. Wrapped in try/catch for std::exception
-            // (won't catch a segfault, but the call site is
-            // identical to the in-game player path so safety is at
-            // parity with normal play).
-            bool gossipOpened = false;
-            std::string gossipError;
-            try
-            {
-                WorldPacket data;
-                data << og;
-                bot->GetSession()->HandleGossipHelloOpcode(data);
-                gossipOpened = true;
-            }
-            catch (std::exception const& e)
-            {
-                gossipError = std::string("gossip_hello threw: ") + e.what();
-            }
-            out["gossip_opened"] = gossipOpened;
-            if (!gossipError.empty())
-                out["gossip_error"] = gossipError;
-
-            // Read back the populated gossip menu, if any, so the
-            // agent can pick an option without knowing the NPC's
-            // gossip schema in advance.
-            if (gossipOpened && bot->PlayerTalkClass)
-            {
-                json gossipOpts = json::array();
-                GossipMenu& menu = bot->PlayerTalkClass->GetGossipMenu();
-                for (auto const& [idx, item] : menu.GetMenuItems())
-                {
-                    gossipOpts.push_back({
-                        {"index", idx},
-                        {"icon",  static_cast<int>(item.MenuItemIcon)},
-                        {"text",  item.Message}
-                    });
-                }
-                out["gossip_options"] = gossipOpts;
-                out["gossip_menu_open_id"] = menu.GetMenuId();
-            }
-
-            return out.dump();
-        }
 
         // Translate a verb JSON into a result JSON. Runs on the world
         // thread, so any Playerbots API is fair game.
@@ -688,60 +635,11 @@ namespace Sbywow::Bridge
                 return ok.dump();
             }
 
-            if (verb == "seize")
-            {
-                bool wasSeized = sess.IsSeized();
-                sess.SetSeized(true);
-                if (!wasSeized)
-                    EmitControlEvent(sess, "seize_acquired", "explicit");
-                json ok = { {"ok", true}, {"verb", "seize"}, {"seized", true} };
-                return ok.dump();
-            }
-
-            if (verb == "release")
-            {
-                bool wasSeized = sess.IsSeized();
-                sess.SetSeized(false);
-                if (wasSeized)
-                    EmitControlEvent(sess, "seize_released", "explicit");
-                json ok = { {"ok", true}, {"verb", "release"}, {"seized", false} };
-                return ok.dump();
-            }
-
+            // do_action queues a DoAction intent. Engine's
+            // ExecuteDoAction calls PlayerbotAI::DoSpecificAction
+            // — same as the prior inline body, just relocated.
             if (verb == "do_action")
-            {
-                std::string name      = req.value("name",      "");
-                std::string qualifier = req.value("qualifier", "");
-                if (name.empty())
-                {
-                    json err = { {"ok", false}, {"error", "do_action requires name"} };
-                    return err.dump();
-                }
-
-                PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
-                if (!ai)
-                {
-                    json err = { {"ok", false}, {"error", "no PlayerbotAI for this bot"} };
-                    return err.dump();
-                }
-
-                // Tag the call as agent-originated so the listener bypass
-                // the seize veto. Scope ensures the flag clears even if
-                // DoSpecificAction throws (it shouldn't, but cheap safety).
-                Event ev;
-                bool result;
-                {
-                    ScopedAgentAction tag(sess);
-                    result = ai->DoSpecificAction(name, ev, /*silent=*/true, qualifier);
-                }
-                json ok = {
-                    {"ok",        result},
-                    {"verb",      "do_action"},
-                    {"name",      name},
-                    {"qualifier", qualifier}
-                };
-                return ok.dump();
-            }
+                return QueueDoActionIntent(sess, cmd, req);
 
             // ---- Strategy management (the nudge layer) ----------------
 
@@ -920,47 +818,22 @@ namespace Sbywow::Bridge
             if (verb == "find_nearby")
                 return DoFindNearby(bot, req);
 
+            // interact_with queues an Interact intent. The
+            // gossip-menu read happens inside the engine's
+            // ExecuteInteract on the world thread — same call shape
+            // as the prior inline body.
             if (verb == "interact_with")
-                return DoInteractWith(bot, req);
+                return QueueInteractIntent(sess, cmd, req);
 
-            // ---- Chat / say -------------------------------------------
-
+            // say queues a Say intent.
             if (verb == "say")
-            {
-                PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
-                if (!ai)
-                {
-                    json err = { {"ok", false}, {"error", "no PlayerbotAI for this bot"} };
-                    return err.dump();
-                }
-                std::string text    = req.value("text",    "");
-                std::string channel = req.value("channel", "say");
-                if (text.empty())
-                {
-                    json err = { {"ok", false}, {"error", "say requires text"} };
-                    return err.dump();
-                }
+                return QueueSayIntent(sess, cmd, req);
 
-                bool ok = false;
-                if      (channel == "say")     ok = ai->Say(text);
-                else if (channel == "yell")    ok = ai->Yell(text);
-                else if (channel == "party")   ok = ai->SayToParty(text);
-                else if (channel == "raid")    ok = ai->SayToRaid(text);
-                else if (channel == "guild")   ok = ai->SayToGuild(text);
-                else if (channel == "world")   ok = ai->SayToWorld(text);
-                else if (channel == "master")
-                {
-                    // TellMaster requires a bound master; best-effort.
-                    ok = ai->TellMaster(text);
-                }
-                else
-                {
-                    json err = { {"ok", false}, {"error", "unknown channel: " + channel +
-                                  " (say|yell|party|raid|guild|world|master)"} };
-                    return err.dump();
-                }
-                return json{ {"ok", ok}, {"verb", "say"}, {"channel", channel}, {"text", text} }.dump();
-            }
+            // wait suspends engine intent dispatch for N ms; useful
+            // for chaining "do A, hold, do B" sequences without the
+            // harness needing to time-out HTTP round-trips.
+            if (verb == "wait")
+                return QueueWaitIntent(sess, cmd, req);
 
             json err = { {"ok", false}, {"error", "unknown verb: " + verb} };
             return err.dump();
@@ -999,7 +872,9 @@ namespace Sbywow::Bridge
             // else: deferred — engine owns the promise now.
         }
 
-        // AFK degradation. Heartbeat-driven for v1.
+        // AFK degradation. Heartbeat-driven: stale heartbeat sets the
+        // /afk marker so other party members can see the agent isn't
+        // home; restored heartbeat clears it.
         bool stale = session->HeartbeatAgeMs() > config_.heartbeatTimeoutMs;
         bool wasAfk = session->IsAfk();
         if (stale && !wasAfk)
@@ -1007,13 +882,6 @@ namespace Sbywow::Bridge
             session->SetAfk(true);
             bot->ToggleAFK();
             bot->autoReplyMsg = "Agent unresponsive — autonomic only";
-            // Force-release seize on heartbeat loss so a dead harness
-            // doesn't pin the bot in a frozen state.
-            if (session->IsSeized())
-            {
-                session->SetSeized(false);
-                EmitControlEvent(*session, "seize_released", "heartbeat_timeout");
-            }
         }
         else if (!stale && wasAfk)
         {
@@ -1156,7 +1024,7 @@ namespace Sbywow::Bridge
                         {"heartbeat_ms",    sess->HeartbeatAgeMs()},
                         {"afk",             sess->IsAfk()},
                         {"sse_attached",    sess->IsSseAttached()},
-                        {"seized",          sess->IsSeized()}
+                        {"intent_count",    static_cast<int>(sess->IntentCount())}
                     });
                 }
             }
