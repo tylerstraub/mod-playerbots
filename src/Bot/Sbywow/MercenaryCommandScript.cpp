@@ -2,11 +2,14 @@
 #include "Chat.h"
 #include "DatabaseEnv.h"
 #include "Field.h"
+#include "Map.h"
 #include "MercenaryFactory.h"
 #include "MercenaryMgr.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "PlayerbotFactory.h"
+#include "PlayerbotMgr.h"
+#include "Playerbots.h"  // GET_PLAYERBOT_MGR
 #include "QueryResult.h"
 #include "SbywowConstants.h"
 #include "ScriptMgr.h"
@@ -67,17 +70,21 @@ public:
         static ChatCommandTable mercAdminTable = {
             {"setup",   HandleAdminSetupCommand,   SEC_GAMEMASTER,    Console::Yes},
             {"service", HandleAdminServiceCommand, SEC_GAMEMASTER,    Console::Yes},
+            {"reap",    HandleAdminReapCommand,    SEC_GAMEMASTER,    Console::Yes},
             {"hire",    HandleAdminHireCommand,    SEC_ADMINISTRATOR, Console::Yes},
             {"nuke",    HandleAdminNukeCommand,    SEC_ADMINISTRATOR, Console::Yes},
         };
 
         static ChatCommandTable mercTable = {
-            {"hire",       HandleHireCommand,       SEC_PLAYER,     Console::No},
-            {"list",       HandleListCommand,       SEC_PLAYER,     Console::No},
-            {"dismiss",    HandleDismissCommand,    SEC_PLAYER,     Console::No},
-            {"dismissall", HandleDismissAllCommand, SEC_PLAYER,     Console::No},
-            {"resync",    HandleResyncCommand,      SEC_GAMEMASTER, Console::No},
-            {"admin",     mercAdminTable},
+            {"hire",       HandleHireCommand,       SEC_PLAYER, Console::No},
+            {"list",       HandleListCommand,       SEC_PLAYER, Console::No},
+            {"info",       HandleInfoCommand,       SEC_PLAYER, Console::No},
+            {"summon",     HandleSummonCommand,     SEC_PLAYER, Console::No},
+            {"unsummon",   HandleUnsummonCommand,   SEC_PLAYER, Console::No},
+            {"dismiss",    HandleDismissCommand,    SEC_PLAYER, Console::No},
+            {"dismissall", HandleDismissAllCommand, SEC_PLAYER, Console::No},
+            {"resync",     HandleResyncCommand,     SEC_PLAYER, Console::No},
+            {"admin",      mercAdminTable},
         };
 
         static ChatCommandTable commandTable = {
@@ -154,6 +161,164 @@ public:
             handler->PSendSysMessage("  '{}' — {} (level {}, guid={})",
                 entry->Name, ClassName(entry->Class), uint32(entry->Level), mercGuid.GetCounter());
         }
+        return true;
+    }
+
+    // .merc info <name> — detailed state for one merc. Online: live position
+    // and HP from the Player object. Offline: last-saved snapshot from the
+    // characters table.
+    static bool HandleInfoCommand(ChatHandler* handler, char const* args)
+    {
+        Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        if (!player)
+            return false;
+
+        std::string name = args ? args : "";
+        if (name.empty())
+        {
+            handler->SendSysMessage("Usage: .merc info <name>");
+            return true;
+        }
+
+        ObjectGuid mercGuid = sCharacterCache->GetCharacterGuidByName(name);
+        if (mercGuid.IsEmpty() || !sMercenaryMgr.IsOwnedBy(mercGuid, player->GetGUID()))
+        {
+            handler->PSendSysMessage("'{}' is not one of your mercenaries.", name);
+            return true;
+        }
+
+        CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(mercGuid);
+        if (!entry)
+        {
+            handler->PSendSysMessage("'{}' has no cache entry — try .merc admin reap.", name);
+            return true;
+        }
+
+        handler->PSendSysMessage("Mercenary '{}' (guid={}):", entry->Name, mercGuid.GetCounter());
+        handler->PSendSysMessage("  Class: {}, Level: {}", ClassName(entry->Class), uint32(entry->Level));
+
+        Player* merc = ObjectAccessor::FindConnectedPlayer(mercGuid);
+        if (merc)
+        {
+            uint32 hpPct = merc->GetMaxHealth() > 0
+                ? uint32((100ull * merc->GetHealth()) / merc->GetMaxHealth())
+                : 0;
+            char const* deadTag = merc->IsAlive() ? "" : " [DEAD]";
+            handler->PSendSysMessage("  State: ONLINE — map={}, zone={}, pos=({:.1f}, {:.1f}, {:.1f})",
+                merc->GetMapId(), merc->GetZoneId(),
+                merc->GetPositionX(), merc->GetPositionY(), merc->GetPositionZ());
+            handler->PSendSysMessage("  HP: {}/{} ({}%){}", merc->GetHealth(), merc->GetMaxHealth(), hpPct, deadTag);
+            if (Group* grp = merc->GetGroup())
+                handler->PSendSysMessage("  Group leader: guid={}", grp->GetLeaderGUID().GetCounter());
+            else
+                handler->SendSysMessage("  Group: solo");
+        }
+        else
+        {
+            QueryResult res = CharacterDatabase.Query(
+                "SELECT map, zone, position_x, position_y, position_z, health, logout_time "
+                "FROM characters WHERE guid = {}", mercGuid.GetCounter());
+            if (!res)
+            {
+                handler->PSendSysMessage("  State: OFFLINE — character row missing (orphan candidate; will be reaped on next restart)");
+                return true;
+            }
+            Field* f = res->Fetch();
+            handler->PSendSysMessage("  State: OFFLINE — last-saved map={}, zone={}, pos=({:.1f}, {:.1f}, {:.1f})",
+                f[0].Get<uint16>(), f[1].Get<uint16>(),
+                f[2].Get<float>(), f[3].Get<float>(), f[4].Get<float>());
+            handler->PSendSysMessage("  Last-saved HP: {}, logout_time epoch: {}",
+                f[5].Get<uint32>(), f[6].Get<uint32>());
+        }
+        return true;
+    }
+
+    // .merc summon <name> — manual force-summon. Use when autosummon failed,
+    // or when you want to call a previously-unsummoned merc back without
+    // waiting for the next zone change. No-op if already in world.
+    static bool HandleSummonCommand(ChatHandler* handler, char const* args)
+    {
+        Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        if (!player)
+            return false;
+
+        std::string name = args ? args : "";
+        if (name.empty())
+        {
+            handler->SendSysMessage("Usage: .merc summon <name>");
+            return true;
+        }
+
+        ObjectGuid mercGuid = sCharacterCache->GetCharacterGuidByName(name);
+        if (mercGuid.IsEmpty() || !sMercenaryMgr.IsOwnedBy(mercGuid, player->GetGUID()))
+        {
+            handler->PSendSysMessage("'{}' is not one of your mercenaries.", name);
+            return true;
+        }
+
+        if (ObjectAccessor::FindConnectedPlayer(mercGuid))
+        {
+            handler->PSendSysMessage("'{}' is already summoned.", name);
+            return true;
+        }
+
+        if (Map* m = player->GetMap(); m && m->IsBattlegroundOrArena())
+        {
+            handler->SendSysMessage("Cannot summon mercenaries while in a battleground or arena.");
+            return true;
+        }
+
+        PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
+        if (!mgr)
+        {
+            handler->SendSysMessage("PlayerbotMgr not available — cannot summon.");
+            return true;
+        }
+
+        std::string cmd = "add " + name;
+        mgr->HandlePlayerbotCommand(cmd.c_str(), player);
+        handler->PSendSysMessage("Summoning '{}'...", name);
+        return true;
+    }
+
+    // .merc unsummon <name> — graceful despawn without dismissing. Saves state
+    // via PlayerbotMgr::LogoutPlayerBot so the next summon picks up where
+    // they left off. Useful for testing despawn-then-resummon flows.
+    static bool HandleUnsummonCommand(ChatHandler* handler, char const* args)
+    {
+        Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        if (!player)
+            return false;
+
+        std::string name = args ? args : "";
+        if (name.empty())
+        {
+            handler->SendSysMessage("Usage: .merc unsummon <name>");
+            return true;
+        }
+
+        ObjectGuid mercGuid = sCharacterCache->GetCharacterGuidByName(name);
+        if (mercGuid.IsEmpty() || !sMercenaryMgr.IsOwnedBy(mercGuid, player->GetGUID()))
+        {
+            handler->PSendSysMessage("'{}' is not one of your mercenaries.", name);
+            return true;
+        }
+
+        if (!ObjectAccessor::FindConnectedPlayer(mercGuid))
+        {
+            handler->PSendSysMessage("'{}' is already offline.", name);
+            return true;
+        }
+
+        PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
+        if (!mgr)
+        {
+            handler->SendSysMessage("PlayerbotMgr not available — cannot unsummon.");
+            return true;
+        }
+
+        mgr->LogoutPlayerBot(mercGuid);
+        handler->PSendSysMessage("Unsummoned '{}'.", name);
         return true;
     }
 
@@ -298,6 +463,17 @@ public:
         handler->PSendSysMessage("  Guildmaster guid: {}",
             sMercenaryMgr.GetGuildmasterGuid().ToString());
         handler->PSendSysMessage("  Total mercs in DB: {}", totalMercs);
+        return true;
+    }
+
+    // .merc admin reap — trigger the orphan reaper without restarting. Three
+    // sweeps log to Server.log (server.loading channel); this command just
+    // returns a one-line ack since the detail goes to log.
+    static bool HandleAdminReapCommand(ChatHandler* handler, char const* /*args*/)
+    {
+        handler->SendSysMessage("Sbywow: running ReapOrphans — see Server.log for sweep details.");
+        sMercenaryMgr.ReapOrphans();
+        handler->SendSysMessage("Sbywow: ReapOrphans complete.");
         return true;
     }
 
