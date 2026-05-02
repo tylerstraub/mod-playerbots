@@ -2,13 +2,16 @@
 
 #include "BotSession.h"
 
+#include "AiObjectContext.h"
 #include "Config.h"
+#include "Engine.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "Value.h"
 
 // Vendored single-header deps. Kept local to the bridge so we don't take
 // on a cross-module dependency on mod-playerbots-characters' deps tree.
@@ -16,6 +19,7 @@
 #include "deps/json.hpp"
 
 #include <chrono>
+#include <functional>
 #include <regex>
 #include <sstream>
 
@@ -177,6 +181,46 @@ namespace Sbywow::Bridge
             sess.PushOutbound(ev.dump());
         }
 
+        // Resolve string state name to BotState, or -1 for "all".
+        // Returns -2 on invalid name. Default mapping if absent: non-combat.
+        int ParseBotState(std::string const& s)
+        {
+            if (s.empty() || s == "non-combat" || s == "noncombat") return BOT_STATE_NON_COMBAT;
+            if (s == "combat")                                       return BOT_STATE_COMBAT;
+            if (s == "dead")                                         return BOT_STATE_DEAD;
+            if (s == "all")                                          return -1;
+            return -2;
+        }
+
+        char const* BotStateName(BotState s)
+        {
+            switch (s)
+            {
+                case BOT_STATE_COMBAT:     return "combat";
+                case BOT_STATE_NON_COMBAT: return "non-combat";
+                case BOT_STATE_DEAD:       return "dead";
+                default:                   return "?";
+            }
+        }
+
+        // For verbs that operate on engines: invoke `fn` on each engine
+        // matching `state` (-1 = all). Returns the list of states it ran
+        // against for diagnostics.
+        json ForEachEngine(PlayerbotAI* ai, int state, std::function<void(Engine*, BotState)> const& fn)
+        {
+            json states = json::array();
+            for (uint8 i = 0; i < BOT_STATE_MAX; ++i)
+            {
+                if (state >= 0 && i != static_cast<uint8>(state)) continue;
+                if (Engine* e = ai->GetEngine(static_cast<BotState>(i)))
+                {
+                    fn(e, static_cast<BotState>(i));
+                    states.push_back(BotStateName(static_cast<BotState>(i)));
+                }
+            }
+            return states;
+        }
+
         // Translate a verb JSON into a result JSON. Runs on the world
         // thread, so any Playerbots API is fair game.
         std::string DispatchCommand(Player* bot, BotSession& sess, std::string const& cmdJson)
@@ -250,6 +294,187 @@ namespace Sbywow::Bridge
                     {"qualifier", qualifier}
                 };
                 return ok.dump();
+            }
+
+            // ---- Strategy management (the nudge layer) ----------------
+
+            if (verb == "add_strategy" || verb == "remove_strategy" || verb == "change_strategies")
+            {
+                PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+                if (!ai)
+                {
+                    json err = { {"ok", false}, {"error", "no PlayerbotAI for this bot"} };
+                    return err.dump();
+                }
+
+                std::string stateStr = req.value("state", "non-combat");
+                int state = ParseBotState(stateStr);
+                if (state == -2)
+                {
+                    json err = { {"ok", false}, {"error", "bad state: " + stateStr +
+                                  " (combat|non-combat|dead|all)"} };
+                    return err.dump();
+                }
+
+                json applied;
+                if (verb == "add_strategy")
+                {
+                    std::string name = req.value("name", "");
+                    if (name.empty())
+                    {
+                        json err = { {"ok", false}, {"error", "add_strategy requires name"} };
+                        return err.dump();
+                    }
+                    applied = ForEachEngine(ai, state, [&](Engine* e, BotState) { e->addStrategy(name); });
+                }
+                else if (verb == "remove_strategy")
+                {
+                    std::string name = req.value("name", "");
+                    if (name.empty())
+                    {
+                        json err = { {"ok", false}, {"error", "remove_strategy requires name"} };
+                        return err.dump();
+                    }
+                    applied = ForEachEngine(ai, state, [&](Engine* e, BotState) { e->removeStrategy(name); });
+                }
+                else // change_strategies — comma-syntax: "+kite,-aggressive,~focus"
+                {
+                    std::string ops = req.value("ops", "");
+                    if (ops.empty())
+                    {
+                        json err = { {"ok", false}, {"error", "change_strategies requires ops"} };
+                        return err.dump();
+                    }
+                    applied = ForEachEngine(ai, state, [&](Engine* e, BotState) { e->ChangeStrategy(ops); });
+                }
+
+                json ok = { {"ok", true}, {"verb", verb}, {"applied_to", applied} };
+                return ok.dump();
+            }
+
+            if (verb == "list_strategies")
+            {
+                PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+                if (!ai)
+                {
+                    json err = { {"ok", false}, {"error", "no PlayerbotAI for this bot"} };
+                    return err.dump();
+                }
+
+                std::string stateStr = req.value("state", "all");
+                int state = ParseBotState(stateStr);
+                if (state == -2)
+                {
+                    json err = { {"ok", false}, {"error", "bad state: " + stateStr} };
+                    return err.dump();
+                }
+
+                json out = json::object();
+                for (uint8 i = 0; i < BOT_STATE_MAX; ++i)
+                {
+                    if (state >= 0 && i != static_cast<uint8>(state)) continue;
+                    BotState s = static_cast<BotState>(i);
+                    if (Engine* e = ai->GetEngine(s))
+                        out[BotStateName(s)] = e->GetStrategies();
+                }
+                return json{ {"ok", true}, {"verb", "list_strategies"}, {"strategies", out} }.dump();
+            }
+
+            // ---- Value system (set/get on AiObjectContext) ------------
+
+            if (verb == "set_value" || verb == "get_value")
+            {
+                PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+                if (!ai)
+                {
+                    json err = { {"ok", false}, {"error", "no PlayerbotAI for this bot"} };
+                    return err.dump();
+                }
+                std::string key = req.value("key", "");
+                if (key.empty())
+                {
+                    json err = { {"ok", false}, {"error", verb + " requires key"} };
+                    return err.dump();
+                }
+
+                UntypedValue* uv = ai->GetAiObjectContext()->GetUntypedValue(key);
+                if (!uv)
+                {
+                    json err = { {"ok", false}, {"error", "no such value key: " + key} };
+                    return err.dump();
+                }
+
+                if (verb == "get_value")
+                {
+                    // Format() is the human-display form; Save() is the
+                    // round-trippable form (inverse of Load). Many value
+                    // types override one but not the other, and both
+                    // default to "?" in UntypedValue. Return both so the
+                    // agent picks whichever is meaningful for the key.
+                    return json{
+                        {"ok",     true},
+                        {"verb",   "get_value"},
+                        {"key",    key},
+                        {"format", uv->Format()},
+                        {"save",   uv->Save()}
+                    }.dump();
+                }
+
+                // set_value — UntypedValue::Load takes a string and
+                // returns true on success. Many value types don't
+                // override Load (returns false by default); honestly
+                // surface that to the agent so it knows the key is
+                // read-only via this generic path.
+                std::string val = req.value("value", "");
+                bool loaded = uv->Load(val);
+                json out = {
+                    {"ok",    loaded},
+                    {"verb",  "set_value"},
+                    {"key",   key},
+                    {"value", val}
+                };
+                if (!loaded)
+                    out["error"] = "value type does not support Load() (read-only via set_value)";
+                return out.dump();
+            }
+
+            // ---- Chat / say -------------------------------------------
+
+            if (verb == "say")
+            {
+                PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+                if (!ai)
+                {
+                    json err = { {"ok", false}, {"error", "no PlayerbotAI for this bot"} };
+                    return err.dump();
+                }
+                std::string text    = req.value("text",    "");
+                std::string channel = req.value("channel", "say");
+                if (text.empty())
+                {
+                    json err = { {"ok", false}, {"error", "say requires text"} };
+                    return err.dump();
+                }
+
+                bool ok = false;
+                if      (channel == "say")     ok = ai->Say(text);
+                else if (channel == "yell")    ok = ai->Yell(text);
+                else if (channel == "party")   ok = ai->SayToParty(text);
+                else if (channel == "raid")    ok = ai->SayToRaid(text);
+                else if (channel == "guild")   ok = ai->SayToGuild(text);
+                else if (channel == "world")   ok = ai->SayToWorld(text);
+                else if (channel == "master")
+                {
+                    // TellMaster requires a bound master; best-effort.
+                    ok = ai->TellMaster(text);
+                }
+                else
+                {
+                    json err = { {"ok", false}, {"error", "unknown channel: " + channel +
+                                  " (say|yell|party|raid|guild|world|master)"} };
+                    return err.dump();
+                }
+                return json{ {"ok", ok}, {"verb", "say"}, {"channel", channel}, {"text", text} }.dump();
             }
 
             json err = { {"ok", false}, {"error", "unknown verb: " + verb} };
