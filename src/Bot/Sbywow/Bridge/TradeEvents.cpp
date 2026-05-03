@@ -33,6 +33,11 @@ using json = nlohmann::json;
 
 namespace
 {
+    // Forward declarations — money_offered dedup helpers live below
+    // EmitTradeStatus_Impl but are called from within it on lifecycle
+    // boundaries.
+    void ClearMoneyDedup(Player* viewer);
+
     // Attached-bot predicate, mirrors the BridgeHooks helper.
     bool IsAttachedBot(Player* p)
     {
@@ -137,6 +142,15 @@ namespace
         if (!kind)
             return;
 
+        // Reset money_offered dedup at trade lifecycle boundaries —
+        // a fresh trade window should always emit the partner's first
+        // money_offered (typically 0 from the UI handshake), and after
+        // a cancel/complete the next trade is a fresh story.
+        std::string kindStr = kind;
+        if (kindStr == "opened" || kindStr == "cancelled" ||
+            kindStr == "completed" || kindStr == "failed")
+            ClearMoneyDedup(viewer);
+
         json ev = BaseEvent(viewer, "trade", kind);
         ev["status_code"] = static_cast<int>(info.Status);
 
@@ -227,6 +241,23 @@ namespace
             fire(partner, "partner");
     }
 
+    // Per-viewer dedup state for money_offered events. The WoW client
+    // UI fires CMSG_SET_TRADE_GOLD as a handshake during trade-window
+    // initialization (sometimes 4-6 times in rapid succession with the
+    // same value, usually 0), which inflates the SSE rate without
+    // adding signal. Suppress consecutive identical (source, copper)
+    // events per viewer; reset on trade.opened / trade.cancelled /
+    // trade.completed in EmitTradeStatus_Impl. World-thread only — no
+    // lock needed.
+    struct LastMoney { std::string source; uint32 copper; bool valid = false; };
+    std::unordered_map<uint64_t /*viewer raw guid*/, LastMoney> g_lastMoneyOffered;
+
+    void ClearMoneyDedup(Player* viewer)
+    {
+        if (!viewer) return;
+        g_lastMoneyOffered.erase(viewer->GetGUID().GetRawValue());
+    }
+
     void EmitTradeMoneySet_Impl(Player* actor, uint32 copper)
     {
         if (!actor)
@@ -236,6 +267,13 @@ namespace
         {
             if (!IsAttachedBot(viewer))
                 return;
+            // Dedup: identical-to-last (source, copper) is suppressed.
+            auto& last = g_lastMoneyOffered[viewer->GetGUID().GetRawValue()];
+            if (last.valid && last.source == perspective && last.copper == copper)
+                return;
+            last.source = perspective;
+            last.copper = copper;
+            last.valid  = true;
             json ev = BaseEvent(viewer, "trade", "money_offered");
             ev["source"] = perspective;
             ev["copper"] = copper;
