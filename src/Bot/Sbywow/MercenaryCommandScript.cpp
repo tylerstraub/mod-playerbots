@@ -2,6 +2,7 @@
 #include "BotSession.h"
 #include "CharacterCache.h"
 #include "Chat.h"
+#include "Config.h"
 #include "DatabaseEnv.h"
 #include "Field.h"
 #include "Map.h"
@@ -175,10 +176,12 @@ public:
         }
 
         uint32 currentCount = sMercenaryMgr.GetMercCount(player->GetGUID());
-        if (currentCount >= Sbywow::MAX_MERCS_PER_OWNER)
+        uint32 maxMercs = sConfigMgr->GetOption<uint32>("Mercenaries.MaxPerOwner",
+            Sbywow::DEFAULT_MAX_MERCS_PER_OWNER);
+        if (currentCount >= maxMercs)
         {
             handler->PSendSysMessage("You already have {} mercenaries (cap: {}). Dismiss one before hiring another.",
-                currentCount, Sbywow::MAX_MERCS_PER_OWNER);
+                currentCount, maxMercs);
             return true;
         }
 
@@ -694,10 +697,6 @@ public:
         handler->SendSysMessage("Mercenary service status:");
         handler->PSendSysMessage("  Service account: '{}' (id={})",
             Sbywow::SERVICE_ACCOUNT_NAME, sMercenaryMgr.GetServiceAccountId());
-        handler->PSendSysMessage("  Mercenaries guild id: {} (0 = not yet bootstrapped)",
-            sMercenaryMgr.GetMercenariesGuildId());
-        handler->PSendSysMessage("  Guildmaster guid: {}",
-            sMercenaryMgr.GetGuildmasterGuid().ToString());
         handler->PSendSysMessage("  Total mercs in DB: {}", totalMercs);
         return true;
     }

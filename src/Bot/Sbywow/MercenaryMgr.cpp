@@ -4,47 +4,23 @@
 #include "CharacterCache.h"
 #include "DatabaseEnv.h"
 #include "Field.h"
-#include "Guild.h"
-#include "GuildMgr.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "PlayerbotMgr.h"
 #include "Playerbots.h"  // GET_PLAYERBOT_MGR
 #include "QueryResult.h"
-#include "RandomPlayerbotFactory.h"
 #include "SbywowConstants.h"
 #include "SharedDefines.h"
-#include "WorldSession.h"
 
 #include <chrono>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 void MercenaryMgr::EnsureServiceState()
 {
     if (_serviceAccountId == 0)
         ensureServiceAccount();
-
-    if (_serviceAccountId == 0)
-        return;
-
-    if (_mercenariesGuildId != 0)
-        return;
-
-    if (Guild* existing = sGuildMgr->GetGuildByName(Sbywow::MERCENARIES_GUILD_NAME))
-    {
-        _mercenariesGuildId = existing->GetId();
-        _guildmasterGuid = existing->GetLeaderGUID();
-        LOG_INFO("server.loading",
-            "Sbywow: <{}> guild already present (id={}, leader={})",
-            Sbywow::MERCENARIES_GUILD_NAME, _mercenariesGuildId,
-            _guildmasterGuid.ToString());
-        return;
-    }
-
-    bootstrapMercenariesGuild();
 }
 
 void MercenaryMgr::ensureServiceAccount()
@@ -78,75 +54,6 @@ void MercenaryMgr::ensureServiceAccount()
     LOG_INFO("server.loading",
         "Sbywow: created mercenary service account '{}' (id={})",
         Sbywow::SERVICE_ACCOUNT_NAME, _serviceAccountId);
-}
-
-void MercenaryMgr::bootstrapMercenariesGuild()
-{
-    using namespace std::chrono_literals;
-
-    // Reuse the playerbot factory to create the Guildmaster character on the
-    // service account. We accept a random name for v1 — leader name is only
-    // visible in guild info, and we can polish later by extracting a
-    // CreateNamedCharacter helper that takes an explicit name.
-    WorldSession* session = new WorldSession(
-        _serviceAccountId, "", 0x0, nullptr, SEC_PLAYER,
-        EXPANSION_WRATH_OF_THE_LICH_KING, time_t(0), LOCALE_enUS, 0,
-        false, false, 0, true);
-
-    std::unordered_map<RandomPlayerbotFactory::NameRaceAndGender, std::vector<std::string>> emptyCache;
-    RandomPlayerbotFactory factory;
-    Player* gm = factory.CreateRandomBot(session, CLASS_WARRIOR, emptyCache);
-
-    if (!gm)
-    {
-        LOG_ERROR("server.loading", "Sbywow: failed to create Guildmaster character");
-        delete session;
-        return;
-    }
-
-    ObjectGuid gmGuid = gm->GetGUID();
-    std::string gmName = gm->GetName();
-
-    gm->SaveToDB(true, false);
-    sCharacterCache->AddCharacterCacheEntry(
-        gmGuid, _serviceAccountId, gmName,
-        gm->getGender(), gm->getRace(), gm->getClass(), gm->GetLevel());
-
-    // Wait for async write AND for the SYNC connection to see the row, since
-    // Guild::Create internally calls AddMember which uses a SYNC SELECT.
-    while (CharacterDatabase.QueueSize())
-        std::this_thread::sleep_for(50ms);
-    for (int tries = 0; tries < 100; ++tries)
-    {
-        if (CharacterDatabase.Query(
-                "SELECT 1 FROM characters WHERE guid = {}", gmGuid.GetCounter()))
-            break;
-        std::this_thread::sleep_for(50ms);
-    }
-
-    Guild* guild = new Guild();
-    if (!guild->Create(gm, Sbywow::MERCENARIES_GUILD_NAME))
-    {
-        LOG_ERROR("server.loading",
-            "Sbywow: Guild::Create failed for <{}>", Sbywow::MERCENARIES_GUILD_NAME);
-        delete guild;
-        gm->CleanupsBeforeDelete();
-        delete gm;
-        delete session;
-        return;
-    }
-    sGuildMgr->AddGuild(guild);
-
-    _guildmasterGuid = gmGuid;
-    _mercenariesGuildId = guild->GetId();
-
-    gm->CleanupsBeforeDelete();
-    delete gm;
-    delete session;
-
-    LOG_INFO("server.loading",
-        "Sbywow: bootstrapped Guildmaster '{}' (guid={}) and <{}> guild (id={})",
-        gmName, gmGuid.GetCounter(), Sbywow::MERCENARIES_GUILD_NAME, _mercenariesGuildId);
 }
 
 bool MercenaryMgr::IsOwnedBy(ObjectGuid mercGuid, ObjectGuid ownerGuid) const
@@ -264,12 +171,6 @@ void MercenaryMgr::DismissMerc(ObjectGuid mercGuid)
         }
     }
 
-    if (_mercenariesGuildId)
-    {
-        if (Guild* guild = sGuildMgr->GetGuildById(_mercenariesGuildId))
-            guild->DeleteMember(mercGuid, false, true, false);
-    }
-
     Player::DeleteFromDB(mercGuid.GetCounter(), _serviceAccountId, true, true);
     sCharacterCache->DeleteCharacterCacheEntry(mercGuid, mercName);
 
@@ -360,17 +261,16 @@ void MercenaryMgr::ReapOrphans()
     }
 
     // Sweep 3: warn-only. Service-account characters that aren't tracked in
-    // mod_sbywow_mercenaries and aren't the Guildmaster. Could be in-flight
-    // hires that crashed mid-CreateMerc, manual GM-created chars, or stale
-    // test fixtures. We do NOT auto-delete — character deletion is an explicit
-    // action that should pass through .merc admin nuke after human review.
+    // mod_sbywow_mercenaries. Could be in-flight hires that crashed mid-
+    // CreateMerc, manual GM-created chars, or stale test fixtures. We do
+    // NOT auto-delete — character deletion is an explicit action that
+    // should pass through .merc admin nuke after human review.
     {
-        uint32 gmLow = _guildmasterGuid.GetCounter();
         QueryResult res = CharacterDatabase.Query(
             "SELECT c.guid, c.name FROM characters c "
             "LEFT JOIN mod_sbywow_mercenaries m ON m.merc_guid = c.guid "
-            "WHERE c.account = {} AND m.merc_guid IS NULL AND c.guid != {}",
-            _serviceAccountId, gmLow);
+            "WHERE c.account = {} AND m.merc_guid IS NULL",
+            _serviceAccountId);
         uint32 dangling = 0;
         if (res)
         {

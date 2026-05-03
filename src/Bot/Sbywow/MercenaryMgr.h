@@ -15,10 +15,11 @@ public:
         return instance;
     }
 
-    // Idempotent bootstrap: creates the MERCENARIES service account, the
-    // immortal Guildmaster service character, and the <Mercenaries> guild if
-    // any are missing, then caches their IDs. Called once after DB is ready
-    // and from .merc admin setup.
+    // Idempotent bootstrap: creates the dedicated service account that owns
+    // every mercenary character if missing, then caches its ID. Called once
+    // after DB is ready and from .merc admin setup. Mercs spawn guildless;
+    // operators that want a shared merc guild can add membership manually
+    // via the standard guild admin commands.
     void EnsureServiceState();
 
     // Hot-path queries used by the patched PlayerbotMgr::AddPlayerBot
@@ -32,28 +33,23 @@ public:
     void RemoveOwnership(ObjectGuid mercGuid);
 
     // Full dismiss: gracefully despawn if online (via owner's PlayerbotMgr),
-    // remove from <Mercenaries> guild, delete character row, drop cache entry,
-    // drain queue, remove ownership row.
+    // delete character row, drop cache entry, drain queue, remove ownership
+    // row.
     void DismissMerc(ObjectGuid mercGuid);
 
     // Boot-time self-heal: reap orphan rows + log dangling service-account
     // characters. See implementation for the three sweeps.
     void ReapOrphans();
 
-    // Cached after EnsureServiceState. Zero/empty until bootstrap completes.
+    // Cached after EnsureServiceState. Zero until bootstrap completes.
     uint32     GetServiceAccountId()   const { return _serviceAccountId; }
-    uint32     GetMercenariesGuildId() const { return _mercenariesGuildId; }
-    ObjectGuid GetGuildmasterGuid()    const { return _guildmasterGuid; }
 
 private:
     MercenaryMgr() = default;
 
     void ensureServiceAccount();
-    void bootstrapMercenariesGuild();
 
     uint32     _serviceAccountId   = 0;
-    uint32     _mercenariesGuildId = 0;
-    ObjectGuid _guildmasterGuid;
 };
 
 #define sMercenaryMgr MercenaryMgr::instance()

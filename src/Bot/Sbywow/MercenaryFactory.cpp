@@ -2,8 +2,6 @@
 
 #include "CharacterCache.h"
 #include "DatabaseEnv.h"
-#include "Guild.h"
-#include "GuildMgr.h"
 #include "Log.h"
 #include "MercenaryMgr.h"
 #include "ObjectAccessor.h"
@@ -180,9 +178,10 @@ ObjectGuid MercenaryFactory::CreateMerc(ObjectGuid ownerGuid, uint8 classId,
         merc->getGender(), merc->getRace(),
         merc->getClass(), merc->GetLevel());
 
-    // Wait for the async write to land AND for the SYNC connection (which
-    // Guild::AddMember uses for CHAR_SEL_CHAR_DATA_FOR_GUILD) to see it.
-    // QueueSize alone isn't enough — async/sync use different connections.
+    // Drain the async write so the merc row is durable before we hand off
+    // to PlayerbotMgr for auto-summon (which loads from DB on the sync
+    // connection). We wait on both the queue and a sync SELECT against the
+    // SYNC connection because async/sync use different connections.
     while (CharacterDatabase.QueueSize())
         std::this_thread::sleep_for(50ms);
     for (int tries = 0; tries < 100; ++tries)
@@ -191,17 +190,6 @@ ObjectGuid MercenaryFactory::CreateMerc(ObjectGuid ownerGuid, uint8 classId,
                 "SELECT 1 FROM characters WHERE guid = {}", mercGuid.GetCounter()))
             break;
         std::this_thread::sleep_for(50ms);
-    }
-
-    if (uint32 guildId = sMercenaryMgr.GetMercenariesGuildId())
-    {
-        if (Guild* guild = sGuildMgr->GetGuildById(guildId))
-        {
-            if (!guild->AddMember(mercGuid))
-                LOG_WARN("server.misc",
-                    "Sbywow: Guild::AddMember failed for merc guid={}",
-                    mercGuid.GetCounter());
-        }
     }
 
     merc->CleanupsBeforeDelete();
