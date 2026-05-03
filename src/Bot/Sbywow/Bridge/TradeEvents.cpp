@@ -140,20 +140,40 @@ namespace
         json ev = BaseEvent(viewer, "trade", kind);
         ev["status_code"] = static_cast<int>(info.Status);
 
+        Player* partnerPtr = nullptr;
         if (info.Status == TRADE_STATUS_BEGIN_TRADE && info.TraderGuid)
         {
             ev["partner_guid"] = info.TraderGuid.GetRawValue();
             if (Player* partner = ObjectAccessor::FindPlayer(info.TraderGuid))
+            {
                 ev["partner_name"] = partner->GetName();
+                partnerPtr = partner;
+            }
         }
         else if (Player* partner = PartnerOf(viewer))
         {
             ev["partner_guid"] = partner->GetGUID().GetRawValue();
             ev["partner_name"] = partner->GetName();
+            partnerPtr = partner;
         }
 
         if (std::string(kind) == "failed")
             ev["reason"] = StatusToReasonStr(info.Status);
+
+        // cancelled doesn't carry a server-side reason — TRADE_STATUS_
+        // TRADE_CANCELED is fired by both client UI close and explicit
+        // cancel and the auto-faction-rejection path. Surface a
+        // cross_faction hint when we can confirm it; the agent's most
+        // common "trade keeps cancelling" mystery has historically been
+        // the WoW 3.3.5 client UI auto-rejecting opposing-faction trades.
+        // Other cancel reasons (movement, range, explicit cancel) need
+        // pre-cancel state tracking — deferred.
+        if (std::string(kind) == "cancelled" && partnerPtr &&
+            viewer->GetTeamId() != partnerPtr->GetTeamId())
+        {
+            ev["cross_faction"] = true;
+            ev["hint"]          = "client_ui_auto_rejected_cross_faction";
+        }
 
         Push(viewer, ev);
     }

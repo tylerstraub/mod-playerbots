@@ -24,6 +24,7 @@
 #include "Opcodes.h"
 #include "Player.h"
 #include "QuestDef.h"
+#include "SmartEnum.h"
 #include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
@@ -1409,14 +1410,15 @@ namespace Sbywow
         if (res != SPELL_CAST_OK)
         {
             return json{
-                {"ok",          false},
-                {"verb",        "cast_spell"},
-                {"spell_id",    intent.spellId},
-                {"spell_name",  si->SpellName[0] ? si->SpellName[0] : ""},
-                {"target_guid", target->GetGUID().GetRawValue()},
-                {"target_name", target->GetName()},
-                {"cast_result", static_cast<int>(res)},
-                {"error",       "cast pre-check failed"}
+                {"ok",               false},
+                {"verb",             "cast_spell"},
+                {"spell_id",         intent.spellId},
+                {"spell_name",       si->SpellName[0] ? si->SpellName[0] : ""},
+                {"target_guid",      target->GetGUID().GetRawValue()},
+                {"target_name",      target->GetName()},
+                {"cast_result",      static_cast<int>(res)},
+                {"cast_result_name", EnumUtils::ToConstant(res)},
+                {"error",            "cast pre-check failed"}
             }.dump();
         }
         // Cast accepted by CheckCast. If the spell is now in
@@ -1505,13 +1507,30 @@ namespace Sbywow
         bool cdSet    = bot->HasSpellCooldown(spellId);
         if (!inflight && !cdSet)
         {
+            // CastItemUseSpell is void — no SpellCastResult to surface.
+            // Best-effort hint via post-call inspection: which state is
+            // most likely to have caused the refusal? Order matches the
+            // most-common cast-blocking conditions for item-use spells
+            // (hearth, scrolls, bandages, summon-mount items).
+            char const* hint = "pre_check_refused";
+            SpellInfo const* siUse = sSpellMgr->GetSpellInfo(spellId);
+            if (!bot->IsAlive())
+                hint = "caster_dead";
+            else if (bot->isMoving() && siUse && siUse->CalcCastTime() > 0)
+                hint = "moving";
+            else if (bot->IsInCombat() && siUse &&
+                     siUse->HasAttribute(SPELL_ATTR0_NOT_IN_COMBAT_ONLY_PEACEFUL))
+                hint = "in_combat";
+            else if (siUse && siUse->IsCooldownStartedOnEvent())
+                hint = "cooldown_pending_event";
             return json{
-                {"ok",         false},
-                {"verb",       "use_item"},
-                {"item_entry", tpl->ItemId},
-                {"item_name",  tpl->Name1},
-                {"spell_id",   spellId},
-                {"error",      "cast refused (moving / on cooldown / out of range / not ready)"}
+                {"ok",           false},
+                {"verb",         "use_item"},
+                {"item_entry",   tpl->ItemId},
+                {"item_name",    tpl->Name1},
+                {"spell_id",     spellId},
+                {"failure_hint", hint},
+                {"error",        "cast refused — see failure_hint for likely cause"}
             }.dump();
         }
         return json{
@@ -1555,12 +1574,13 @@ namespace Sbywow
         if (res != SPELL_CAST_OK)
         {
             return json{
-                {"ok",          false},
-                {"verb",        "mount"},
-                {"spell_id",    spellId},
-                {"spell_name",  si->SpellName[0] ? si->SpellName[0] : ""},
-                {"cast_result", static_cast<int>(res)},
-                {"error",       "cast pre-check failed"}
+                {"ok",               false},
+                {"verb",             "mount"},
+                {"spell_id",         spellId},
+                {"spell_name",       si->SpellName[0] ? si->SpellName[0] : ""},
+                {"cast_result",      static_cast<int>(res)},
+                {"cast_result_name", EnumUtils::ToConstant(res)},
+                {"error",            "cast pre-check failed"}
             }.dump();
         }
         bool inflight = bot->FindCurrentSpellBySpellId(spellId) != nullptr;
