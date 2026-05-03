@@ -986,17 +986,37 @@ namespace Sbywow
             }.dump();
 
         uint8 count = static_cast<uint8>(std::min<uint32>(intent.quantity ? intent.quantity : 1, 255u));
-        // bag/slot = NULL_BAG/NULL_SLOT means "auto-find a slot."
-        bool ok = bot->BuyItemFromVendorSlot(vGuid, slot, intent.itemEntry, count, NULL_BAG, NULL_SLOT);
+
+        // AC's BuyItemFromVendorSlot returns `crItem->maxcount != 0`
+        // at the bottom — i.e., false for infinite-stock items
+        // (Player.cpp:10826) even on successful purchase. Detect via
+        // money + inventory delta instead of trusting the bool.
+        uint32 moneyBefore   = bot->GetMoney();
+        uint32 itemCountBefore = bot->GetItemCount(intent.itemEntry, /*inBankAlso=*/ false);
+        bot->BuyItemFromVendorSlot(vGuid, slot, intent.itemEntry, count, NULL_BAG, NULL_SLOT);
+        uint32 moneyAfter    = bot->GetMoney();
+        uint32 itemCountAfter = bot->GetItemCount(intent.itemEntry, false);
+
+        bool moneyDropped = moneyAfter < moneyBefore;
+        bool itemsGained  = itemCountAfter > itemCountBefore;
+        bool ok = moneyDropped || itemsGained;
+        // (Both true is the normal case; one true alone happens for
+        // free items or full inventory edge cases.)
 
         return json{
-            {"ok",          ok},
-            {"verb",        "buy_item"},
-            {"vendor_guid", intent.vendorGuid},
-            {"vendor_name", npc->GetName()},
-            {"vendor_slot", slot},
-            {"item_entry",  intent.itemEntry},
-            {"count",       count}
+            {"ok",            ok},
+            {"verb",          "buy_item"},
+            {"vendor_guid",   intent.vendorGuid},
+            {"vendor_name",   npc->GetName()},
+            {"vendor_slot",   slot},
+            {"item_entry",    intent.itemEntry},
+            {"stacks",        count},
+            {"money_before",  moneyBefore},
+            {"money_after",   moneyAfter},
+            {"copper_spent",  moneyBefore > moneyAfter ? moneyBefore - moneyAfter : 0u},
+            {"items_before",  itemCountBefore},
+            {"items_after",   itemCountAfter},
+            {"items_gained",  itemCountAfter > itemCountBefore ? itemCountAfter - itemCountBefore : 0u}
         }.dump();
     }
 
@@ -1406,32 +1426,34 @@ namespace Sbywow
         {
             targets.SetUnitTarget(bot);
         }
-        // Pre-check: if the spell can't even start (moving for a
-        // cast-time spell, on cooldown, etc.), CheckCast returns the
-        // refusal reason. We use Spell::CheckCast directly because
-        // CastItemUseSpell returns void.
-        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
-        if (si)
-        {
-            Spell preflight(bot, si, TRIGGERED_NONE, ObjectGuid::Empty, false);
-            preflight.m_targets   = targets;
-            preflight.m_CastItem  = item;
-            SpellCastResult pre = preflight.CheckCast(true);
-            if (pre != SPELL_CAST_OK)
-            {
-                return json{
-                    {"ok",          false},
-                    {"verb",        "use_item"},
-                    {"item_entry",  tpl->ItemId},
-                    {"item_name",   tpl->Name1},
-                    {"spell_id",    spellId},
-                    {"cast_result", static_cast<int>(pre)},
-                    {"error",       "cast pre-check failed (moving / on cooldown / not ready)"}
-                }.dump();
-            }
-        }
+
+        // CastItemUseSpell returns void — internally constructs a Spell,
+        // runs CheckCast(true), and either calls prepare() on success
+        // (pushing the spell into m_currentSpells) or deletes the
+        // Spell on failure. Detect outcome via post-call inspection
+        // rather than a preflight CheckCast — a stack-allocated
+        // preflight Spell triggers SPELL_FAILED_SPELL_IN_PROGRESS in
+        // the subsequent real CheckCast (Spell.cpp:3465) and silently
+        // suppresses the actual cast.
         bot->CastItemUseSpell(item, targets, /*cast_count*/ 0, /*glyphIndex*/ 0);
+
+        // Three-state detection:
+        //   - spell now in m_currentSpells → cast-time/channeled, in-flight
+        //   - not in m_currentSpells, but cooldown set → instant succeeded
+        //   - not in m_currentSpells, no cooldown → pre-check refused
         bool inflight = bot->FindCurrentSpellBySpellId(spellId) != nullptr;
+        bool cdSet    = bot->HasSpellCooldown(spellId);
+        if (!inflight && !cdSet)
+        {
+            return json{
+                {"ok",         false},
+                {"verb",       "use_item"},
+                {"item_entry", tpl->ItemId},
+                {"item_name",  tpl->Name1},
+                {"spell_id",   spellId},
+                {"error",      "cast refused (moving / on cooldown / out of range / not ready)"}
+            }.dump();
+        }
         return json{
             {"ok",         true},
             {"verb",       "use_item"},
