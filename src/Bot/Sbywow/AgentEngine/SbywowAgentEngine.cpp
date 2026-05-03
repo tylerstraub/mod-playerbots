@@ -985,7 +985,20 @@ namespace Sbywow
                 {"item_entry", intent.itemEntry}
             }.dump();
 
-        uint8 count = static_cast<uint8>(std::min<uint32>(intent.quantity ? intent.quantity : 1, 255u));
+        // intent.quantity is now ITEMS (not stacks/purchases). Each
+        // BuyItemFromVendorSlot call buys 1 "purchase" which yields
+        // tpl->BuyCount items (water = 5/purchase, weapons = 1/purchase).
+        // Compute purchases = ceil(items / BuyCount) so the agent gets
+        // AT LEAST the requested item count. This matches how an agent
+        // naturally thinks ("I want 10 water"), not the raw API.
+        ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(intent.itemEntry);
+        uint32 buyCount = (tpl && tpl->BuyCount > 0) ? tpl->BuyCount : 1u;
+        uint32 itemsRequested = intent.quantity ? intent.quantity : 1u;
+        uint32 purchasesNeeded = (itemsRequested + buyCount - 1) / buyCount;
+        // BuyItemFromVendorSlot uses uint8 for count (number of
+        // purchases), so cap at 255. For higher quantities the agent
+        // can chain calls.
+        uint8 purchases = static_cast<uint8>(std::min<uint32>(purchasesNeeded, 255u));
 
         // AC's BuyItemFromVendorSlot returns `crItem->maxcount != 0`
         // at the bottom — i.e., false for infinite-stock items
@@ -993,7 +1006,7 @@ namespace Sbywow
         // money + inventory delta instead of trusting the bool.
         uint32 moneyBefore   = bot->GetMoney();
         uint32 itemCountBefore = bot->GetItemCount(intent.itemEntry, /*inBankAlso=*/ false);
-        bot->BuyItemFromVendorSlot(vGuid, slot, intent.itemEntry, count, NULL_BAG, NULL_SLOT);
+        bot->BuyItemFromVendorSlot(vGuid, slot, intent.itemEntry, purchases, NULL_BAG, NULL_SLOT);
         uint32 moneyAfter    = bot->GetMoney();
         uint32 itemCountAfter = bot->GetItemCount(intent.itemEntry, false);
 
@@ -1004,19 +1017,21 @@ namespace Sbywow
         // free items or full inventory edge cases.)
 
         return json{
-            {"ok",            ok},
-            {"verb",          "buy_item"},
-            {"vendor_guid",   intent.vendorGuid},
-            {"vendor_name",   npc->GetName()},
-            {"vendor_slot",   slot},
-            {"item_entry",    intent.itemEntry},
-            {"stacks",        count},
-            {"money_before",  moneyBefore},
-            {"money_after",   moneyAfter},
-            {"copper_spent",  moneyBefore > moneyAfter ? moneyBefore - moneyAfter : 0u},
-            {"items_before",  itemCountBefore},
-            {"items_after",   itemCountAfter},
-            {"items_gained",  itemCountAfter > itemCountBefore ? itemCountAfter - itemCountBefore : 0u}
+            {"ok",              ok},
+            {"verb",            "buy_item"},
+            {"vendor_guid",     intent.vendorGuid},
+            {"vendor_name",     npc->GetName()},
+            {"vendor_slot",     slot},
+            {"item_entry",      intent.itemEntry},
+            {"items_requested", itemsRequested},
+            {"buy_count",       buyCount},      // items per vendor "purchase"
+            {"purchases",       purchases},     // calls into vendor API
+            {"money_before",    moneyBefore},
+            {"money_after",     moneyAfter},
+            {"copper_spent",    moneyBefore > moneyAfter ? moneyBefore - moneyAfter : 0u},
+            {"items_before",    itemCountBefore},
+            {"items_after",     itemCountAfter},
+            {"items_gained",    itemCountAfter > itemCountBefore ? itemCountAfter - itemCountBefore : 0u}
         }.dump();
     }
 

@@ -374,6 +374,148 @@ namespace Sbywow::Bridge
             }
         }
 
+        // Stringify ItemClass for the agent — saves it from learning
+        // AC's bitfield numbers. Mirrors enum ItemClass in
+        // ItemTemplate.h. Surfaces alongside the numeric class field
+        // wherever a vendor item / inventory item is described.
+        char const* ItemClassName(uint32 cls)
+        {
+            switch (cls)
+            {
+                case ITEM_CLASS_CONSUMABLE:   return "consumable";
+                case ITEM_CLASS_CONTAINER:    return "container";
+                case ITEM_CLASS_WEAPON:       return "weapon";
+                case ITEM_CLASS_GEM:          return "gem";
+                case ITEM_CLASS_ARMOR:        return "armor";
+                case ITEM_CLASS_REAGENT:      return "reagent";
+                case ITEM_CLASS_PROJECTILE:   return "projectile";
+                case ITEM_CLASS_TRADE_GOODS:  return "trade_goods";
+                case ITEM_CLASS_GENERIC:      return "generic";
+                case ITEM_CLASS_RECIPE:       return "recipe";
+                case ITEM_CLASS_MONEY:        return "money";
+                case ITEM_CLASS_QUIVER:       return "quiver";
+                case ITEM_CLASS_QUEST:        return "quest";
+                case ITEM_CLASS_KEY:          return "key";
+                case ITEM_CLASS_PERMANENT:    return "permanent";
+                case ITEM_CLASS_MISC:         return "misc";
+                case ITEM_CLASS_GLYPH:        return "glyph";
+                default:                      return "unknown";
+            }
+        }
+
+        // Stringify subclass given (class, subclass). Subclass enums
+        // are per-class in WoW, so we dispatch on the class first.
+        // Falls through to "subclass_<n>" for unknown values rather
+        // than failing — keeps the surface forward-compatible.
+        char const* ItemSubclassName(uint32 cls, uint32 sub)
+        {
+            switch (cls)
+            {
+                case ITEM_CLASS_CONSUMABLE:
+                    switch (sub)
+                    {
+                        case ITEM_SUBCLASS_CONSUMABLE:        return "consumable";
+                        case ITEM_SUBCLASS_POTION:            return "potion";
+                        case ITEM_SUBCLASS_ELIXIR:            return "elixir";
+                        case ITEM_SUBCLASS_FLASK:             return "flask";
+                        case ITEM_SUBCLASS_SCROLL:            return "scroll";
+                        case ITEM_SUBCLASS_FOOD:              return "food_drink";
+                        case ITEM_SUBCLASS_ITEM_ENHANCEMENT:  return "item_enhancement";
+                        case ITEM_SUBCLASS_BANDAGE:           return "bandage";
+                        case ITEM_SUBCLASS_CONSUMABLE_OTHER:  return "consumable_other";
+                    }
+                    break;
+                case ITEM_CLASS_WEAPON:
+                    switch (sub)
+                    {
+                        case ITEM_SUBCLASS_WEAPON_AXE:           return "axe_one_hand";
+                        case ITEM_SUBCLASS_WEAPON_AXE2:          return "axe_two_hand";
+                        case ITEM_SUBCLASS_WEAPON_BOW:           return "bow";
+                        case ITEM_SUBCLASS_WEAPON_GUN:           return "gun";
+                        case ITEM_SUBCLASS_WEAPON_MACE:          return "mace_one_hand";
+                        case ITEM_SUBCLASS_WEAPON_MACE2:         return "mace_two_hand";
+                        case ITEM_SUBCLASS_WEAPON_POLEARM:       return "polearm";
+                        case ITEM_SUBCLASS_WEAPON_SWORD:         return "sword_one_hand";
+                        case ITEM_SUBCLASS_WEAPON_SWORD2:        return "sword_two_hand";
+                        case ITEM_SUBCLASS_WEAPON_STAFF:         return "staff";
+                        case ITEM_SUBCLASS_WEAPON_FIST:          return "fist";
+                        case ITEM_SUBCLASS_WEAPON_DAGGER:        return "dagger";
+                        case ITEM_SUBCLASS_WEAPON_THROWN:        return "thrown";
+                        case ITEM_SUBCLASS_WEAPON_CROSSBOW:      return "crossbow";
+                        case ITEM_SUBCLASS_WEAPON_WAND:          return "wand";
+                        case ITEM_SUBCLASS_WEAPON_FISHING_POLE:  return "fishing_pole";
+                    }
+                    break;
+                case ITEM_CLASS_ARMOR:
+                    switch (sub)
+                    {
+                        case ITEM_SUBCLASS_ARMOR_MISC:    return "misc";
+                        case ITEM_SUBCLASS_ARMOR_CLOTH:   return "cloth";
+                        case ITEM_SUBCLASS_ARMOR_LEATHER: return "leather";
+                        case ITEM_SUBCLASS_ARMOR_MAIL:    return "mail";
+                        case ITEM_SUBCLASS_ARMOR_PLATE:   return "plate";
+                        case ITEM_SUBCLASS_ARMOR_BUCKLER: return "buckler";
+                        case ITEM_SUBCLASS_ARMOR_SHIELD:  return "shield";
+                        case ITEM_SUBCLASS_ARMOR_LIBRAM:  return "libram";
+                        case ITEM_SUBCLASS_ARMOR_IDOL:    return "idol";
+                        case ITEM_SUBCLASS_ARMOR_TOTEM:   return "totem";
+                        case ITEM_SUBCLASS_ARMOR_SIGIL:   return "sigil";
+                    }
+                    break;
+                case ITEM_CLASS_TRADE_GOODS:
+                    switch (sub)
+                    {
+                        case ITEM_SUBCLASS_TRADE_GOODS:               return "trade_goods";
+                        case ITEM_SUBCLASS_PARTS:                     return "parts";
+                        case ITEM_SUBCLASS_EXPLOSIVES:                return "explosives";
+                        case ITEM_SUBCLASS_DEVICES:                   return "devices";
+                        case ITEM_SUBCLASS_JEWELCRAFTING:             return "jewelcrafting";
+                        case ITEM_SUBCLASS_CLOTH:                     return "cloth_bolt";
+                        case ITEM_SUBCLASS_LEATHER:                   return "leather_hide";
+                        case ITEM_SUBCLASS_METAL_STONE:               return "metal_stone";
+                        case ITEM_SUBCLASS_MEAT:                      return "meat";
+                        case ITEM_SUBCLASS_HERB:                      return "herb";
+                        case ITEM_SUBCLASS_ELEMENTAL:                 return "elemental";
+                        case ITEM_SUBCLASS_TRADE_GOODS_OTHER:         return "trade_goods_other";
+                        case ITEM_SUBCLASS_ENCHANTING:                return "enchanting";
+                        case ITEM_SUBCLASS_MATERIAL:                  return "material";
+                    }
+                    break;
+                case ITEM_CLASS_PROJECTILE:
+                    switch (sub)
+                    {
+                        case ITEM_SUBCLASS_ARROW:  return "arrow";
+                        case ITEM_SUBCLASS_BULLET: return "bullet";
+                    }
+                    break;
+                case ITEM_CLASS_QUIVER:
+                    switch (sub)
+                    {
+                        case ITEM_SUBCLASS_QUIVER:        return "quiver";
+                        case ITEM_SUBCLASS_AMMO_POUCH:    return "ammo_pouch";
+                    }
+                    break;
+                case ITEM_CLASS_RECIPE:
+                    switch (sub)
+                    {
+                        case ITEM_SUBCLASS_BOOK:           return "book";
+                        case ITEM_SUBCLASS_LEATHERWORKING_PATTERN: return "leatherworking_pattern";
+                        case ITEM_SUBCLASS_TAILORING_PATTERN:      return "tailoring_pattern";
+                        case ITEM_SUBCLASS_ENGINEERING_SCHEMATIC:  return "engineering_schematic";
+                        case ITEM_SUBCLASS_BLACKSMITHING:          return "blacksmithing_plans";
+                        case ITEM_SUBCLASS_COOKING_RECIPE:         return "cooking_recipe";
+                        case ITEM_SUBCLASS_ALCHEMY_RECIPE:         return "alchemy_recipe";
+                        case ITEM_SUBCLASS_FIRST_AID_MANUAL:       return "first_aid_manual";
+                        case ITEM_SUBCLASS_ENCHANTING_FORMULA:     return "enchanting_formula";
+                        case ITEM_SUBCLASS_FISHING_MANUAL:         return "fishing_manual";
+                        case ITEM_SUBCLASS_JEWELCRAFTING_RECIPE:   return "jewelcrafting_recipe";
+                    }
+                    break;
+                default: break;
+            }
+            return nullptr;  // signal "no friendly name; caller surfaces numeric"
+        }
+
         char const* ConsumableBucket(ItemTemplate const* tpl)
         {
             if (!tpl || tpl->Class != ITEM_CLASS_CONSUMABLE) return nullptr;
@@ -1725,25 +1867,37 @@ namespace Sbywow::Bridge
                 return json{{"ok", false}, {"error", "vendor_inventory requires vendor_guid"}}.dump();
             ObjectGuid vGuid(req["vendor_guid"].get<uint64_t>());
 
-            Creature* npc = ObjectAccessor::GetCreature(*bot, vGuid);
+            // Delegate the proximity / vendor-flag / alive checks to
+            // AC's own GetNPCIfCanInteractWith — same gate the buy/
+            // gossip handlers use. Hand-rolled distance checks
+            // (we used 12y center-to-center) didn't match because
+            // AC's IsWithinDistInMap uses bounding-box distance
+            // (combatReach) which can be substantially more permissive.
+            // Mismatch let the agent see vendors via find_nearby that
+            // it could buy from but couldn't read the inventory of.
+            Creature* npc = bot->GetNPCIfCanInteractWith(vGuid, UNIT_NPC_FLAG_VENDOR);
             if (!npc)
-                return json{{"ok", false}, {"error", "vendor not found on bot's map"}}.dump();
-            if (!npc->IsVendor())
-                return json{
-                    {"ok", false},
-                    {"error", "creature is not a vendor"},
-                    {"name", npc->GetName()}
-                }.dump();
-            float dist = bot->GetExactDist(npc);
-            constexpr float kMaxRange = 12.0f;  // matches AC's INTERACTION_DISTANCE roughly
-            if (dist > kMaxRange)
+            {
+                // For better diagnostics, fall back to checking why:
+                // missing on map, dead, not a vendor, or too far?
+                Creature* asCreature = ObjectAccessor::GetCreature(*bot, vGuid);
+                if (!asCreature)
+                    return json{{"ok", false}, {"error", "vendor not found on bot's map"}}.dump();
+                if (!asCreature->IsVendor())
+                    return json{
+                        {"ok", false},
+                        {"error", "creature is not a vendor"},
+                        {"name", asCreature->GetName()}
+                    }.dump();
+                float dist = bot->GetExactDist(asCreature);
                 return json{
                     {"ok",       false},
-                    {"error",    "vendor out of range"},
-                    {"name",     npc->GetName()},
-                    {"distance", dist},
-                    {"max_range", kMaxRange}
+                    {"error",    "vendor out of interact range / dead / hostile"},
+                    {"name",     asCreature->GetName()},
+                    {"distance", dist}
                 }.dump();
+            }
+            float dist = bot->GetExactDist(npc);
 
             VendorItemData const* vItems = npc->GetVendorItems();
             if (!vItems || vItems->Empty())
@@ -1762,20 +1916,25 @@ namespace Sbywow::Bridge
                 if (!vi) continue;
                 ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(vi->item);
                 if (!tpl) continue;
-                items.push_back({
-                    {"slot",            i},
-                    {"entry",           vi->item},
-                    {"name",            tpl->Name1},
-                    {"buy_price",       tpl->BuyPrice},
-                    {"sell_price",      tpl->SellPrice},
-                    {"required_level",  tpl->RequiredLevel},
-                    {"max_stack",       tpl->Stackable},
-                    {"stock_max",       vi->maxcount},        // 0 = infinite
-                    {"extended_cost",   vi->ExtendedCost},
-                    {"quality",         static_cast<int>(tpl->Quality)},
-                    {"item_class",      static_cast<int>(tpl->Class)},
-                    {"item_subclass",   static_cast<int>(tpl->SubClass)}
-                });
+                json one = {
+                    {"slot",                 i},
+                    {"entry",                vi->item},
+                    {"name",                 tpl->Name1},
+                    {"buy_price",            tpl->BuyPrice},
+                    {"sell_price",           tpl->SellPrice},
+                    {"required_level",       tpl->RequiredLevel},
+                    {"max_stack",            tpl->Stackable},
+                    {"buy_count",            tpl->BuyCount},     // items per purchase
+                    {"stock_max",            vi->maxcount},        // 0 = infinite
+                    {"extended_cost",        vi->ExtendedCost},
+                    {"quality",              static_cast<int>(tpl->Quality)},
+                    {"item_class",           static_cast<int>(tpl->Class)},
+                    {"item_class_name",      ItemClassName(tpl->Class)},
+                    {"item_subclass",        static_cast<int>(tpl->SubClass)}
+                };
+                if (char const* sc = ItemSubclassName(tpl->Class, tpl->SubClass))
+                    one["item_subclass_name"] = sc;
+                items.push_back(std::move(one));
             }
 
             return json{
