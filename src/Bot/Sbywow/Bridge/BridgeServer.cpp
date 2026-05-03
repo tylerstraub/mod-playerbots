@@ -437,10 +437,18 @@ namespace Sbywow::Bridge
                         case ITEM_SUBCLASS_WEAPON_POLEARM:       return "polearm";
                         case ITEM_SUBCLASS_WEAPON_SWORD:         return "sword_one_hand";
                         case ITEM_SUBCLASS_WEAPON_SWORD2:        return "sword_two_hand";
+                        case ITEM_SUBCLASS_WEAPON_obsolete:      return "obsolete";
                         case ITEM_SUBCLASS_WEAPON_STAFF:         return "staff";
+                        case ITEM_SUBCLASS_WEAPON_EXOTIC:        return "exotic";
+                        case ITEM_SUBCLASS_WEAPON_EXOTIC2:       return "exotic_two_hand";
                         case ITEM_SUBCLASS_WEAPON_FIST:          return "fist";
+                        // ITEM_SUBCLASS_WEAPON_MISC=14: mining picks,
+                        // blacksmith hammers, fishing tools — anything
+                        // wielded that isn't really a weapon.
+                        case ITEM_SUBCLASS_WEAPON_MISC:          return "tool";
                         case ITEM_SUBCLASS_WEAPON_DAGGER:        return "dagger";
                         case ITEM_SUBCLASS_WEAPON_THROWN:        return "thrown";
+                        case ITEM_SUBCLASS_WEAPON_SPEAR:         return "spear";
                         case ITEM_SUBCLASS_WEAPON_CROSSBOW:      return "crossbow";
                         case ITEM_SUBCLASS_WEAPON_WAND:          return "wand";
                         case ITEM_SUBCLASS_WEAPON_FISHING_POLE:  return "fishing_pole";
@@ -1967,21 +1975,45 @@ namespace Sbywow::Bridge
             Creature* npc = bot->GetNPCIfCanInteractWith(vGuid, UNIT_NPC_FLAG_VENDOR);
             if (!npc)
             {
-                // For better diagnostics, fall back to checking why:
-                // missing on map, dead, not a vendor, or too far?
+                // GetNPCIfCanInteractWith returns null for any of:
+                // not found / dead / hostile / out of interact range /
+                // not a vendor. Disambiguate via individual checks so
+                // the agent can decide whether to walk closer, pick a
+                // different vendor, or bail entirely. Mirrors the
+                // cast_result_name pattern from Batch 5.
                 Creature* asCreature = ObjectAccessor::GetCreature(*bot, vGuid);
                 if (!asCreature)
-                    return json{{"ok", false}, {"error", "vendor not found on bot's map"}}.dump();
+                    return json{
+                        {"ok",     false},
+                        {"reason", "not_found"},
+                        {"error",  "vendor not found on bot's map"}
+                    }.dump();
                 if (!asCreature->IsVendor())
                     return json{
-                        {"ok", false},
-                        {"error", "creature is not a vendor"},
-                        {"name", asCreature->GetName()}
+                        {"ok",     false},
+                        {"reason", "not_vendor"},
+                        {"error",  "creature is not a vendor"},
+                        {"name",   asCreature->GetName()}
+                    }.dump();
+                if (!asCreature->IsAlive())
+                    return json{
+                        {"ok",     false},
+                        {"reason", "dead"},
+                        {"error",  "vendor is dead"},
+                        {"name",   asCreature->GetName()}
+                    }.dump();
+                if (asCreature->IsHostileTo(bot))
+                    return json{
+                        {"ok",     false},
+                        {"reason", "hostile"},
+                        {"error",  "vendor is hostile to bot"},
+                        {"name",   asCreature->GetName()}
                     }.dump();
                 float dist = bot->GetExactDist(asCreature);
                 return json{
                     {"ok",       false},
-                    {"error",    "vendor out of interact range / dead / hostile"},
+                    {"reason",   "out_of_range"},
+                    {"error",    "vendor out of interact range — walk closer"},
                     {"name",     asCreature->GetName()},
                     {"distance", dist}
                 }.dump();
