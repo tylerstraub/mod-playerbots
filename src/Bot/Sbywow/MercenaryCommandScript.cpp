@@ -96,9 +96,23 @@ public:
             {"list",       HandleListCommand,       SEC_PLAYER, Console::No},
             {"info",       HandleInfoCommand,       SEC_PLAYER, Console::No},
             {"summon",     HandleSummonCommand,     SEC_PLAYER, Console::No},
-            {"unsummon",   HandleUnsummonCommand,   SEC_PLAYER, Console::No},
+            // .merc dismiss / unsummon both run the gentle path —
+            // graceful despawn, character + gear preserved, recallable
+            // via .merc summon. Two names because "dismiss" matches
+            // English expectation ("send away") and "unsummon" is
+            // explicit muscle memory. Permanent termination is its own
+            // verb: .merc release.
             {"dismiss",    HandleDismissCommand,    SEC_PLAYER, Console::No},
+            {"unsummon",   HandleDismissCommand,    SEC_PLAYER, Console::No},
             {"dismissall", HandleDismissAllCommand, SEC_PLAYER, Console::No},
+            // .merc release <name> — permanent termination. Cascades
+            // to character delete + drops all bag/equipped items.
+            // Requires confirmation; mail items require explicit
+            // 'force' keyword. The destructive verb that used to be
+            // ".merc dismiss" — renamed because friends kept reading
+            // "dismiss" as the gentle send-away semantic, leading to
+            // accidental gear loss.
+            {"release",    HandleReleaseCommand,    SEC_PLAYER, Console::No},
             {"resync",     HandleResyncCommand,     SEC_PLAYER, Console::No},
             {"agent",      HandleAgentModeCommand,  SEC_PLAYER, Console::No},
             {"admin",      mercAdminTable},
@@ -323,10 +337,18 @@ public:
         return true;
     }
 
-    // .merc unsummon <name> — graceful despawn without dismissing. Saves state
-    // via PlayerbotMgr::LogoutPlayerBot so the next summon picks up where
-    // they left off. Useful for testing despawn-then-resummon flows.
-    static bool HandleUnsummonCommand(ChatHandler* handler, char const* args)
+    // .merc dismiss <name> (and the .merc unsummon alias) — graceful
+    // despawn that PRESERVES the merc. State is saved via
+    // PlayerbotMgr::LogoutPlayerBot so the next .merc summon picks up
+    // where they left off; bag and equipped items are untouched.
+    //
+    // For PERMANENT termination (cascade-delete the character row +
+    // drop all items), use `.merc release <name>` instead — that's the
+    // destructive verb. We split them because friends naturally read
+    // "dismiss" as English "send away," and the previous semantic
+    // (where dismiss == delete) caused accidental gear loss. See
+    // decisions.md "Dismiss is the gentle send-away" (2026-05-02).
+    static bool HandleDismissCommand(ChatHandler* handler, char const* args)
     {
         Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
         if (!player)
@@ -335,7 +357,8 @@ public:
         std::string name = args ? args : "";
         if (name.empty())
         {
-            handler->SendSysMessage("Usage: .merc unsummon <name>");
+            handler->SendSysMessage("Usage: .merc dismiss <name>   (recallable via .merc summon)");
+            handler->SendSysMessage("       .merc release <name>   (permanent — drops gear)");
             return true;
         }
 
@@ -355,16 +378,59 @@ public:
         PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
         if (!mgr)
         {
-            handler->SendSysMessage("PlayerbotMgr not available — cannot unsummon.");
+            handler->SendSysMessage("PlayerbotMgr not available — cannot dismiss.");
             return true;
         }
 
         mgr->LogoutPlayerBot(mercGuid);
-        handler->PSendSysMessage("Unsummoned '{}'.", name);
+        handler->PSendSysMessage("'{}' dismissed (recallable via .merc summon {}).", name, name);
         return true;
     }
 
-    static bool HandleDismissCommand(ChatHandler* handler, char const* args)
+    // .merc dismissall — graceful despawn of every merc the player owns.
+    // Same gentle semantic as .merc dismiss; mercs stay in the roster
+    // and can be re-summoned individually.
+    static bool HandleDismissAllCommand(ChatHandler* handler, char const* /*args*/)
+    {
+        Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        if (!player)
+            return false;
+
+        std::vector<ObjectGuid> mercs = sMercenaryMgr.GetMercsForOwner(player->GetGUID());
+        if (mercs.empty())
+        {
+            handler->SendSysMessage("You have no mercenaries to dismiss.");
+            return true;
+        }
+
+        PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
+        if (!mgr)
+        {
+            handler->SendSysMessage("PlayerbotMgr not available — cannot dismiss.");
+            return true;
+        }
+
+        uint32 count = 0;
+        for (ObjectGuid mercGuid : mercs)
+        {
+            if (!ObjectAccessor::FindConnectedPlayer(mercGuid))
+                continue;
+            mgr->LogoutPlayerBot(mercGuid);
+            ++count;
+        }
+
+        handler->PSendSysMessage("Dismissed {} mercenary(s) (all recallable via .merc summon).", count);
+        return true;
+    }
+
+    // .merc release <name> [force] — permanent termination. Cascade-
+    // deletes the character row + drops all bag/equipped items. Mail
+    // items require explicit `force` confirmation. This is the
+    // destructive verb that used to be ".merc dismiss"; renamed
+    // because friends kept reading "dismiss" as the gentle send-away
+    // and accidentally losing gear. See decisions.md
+    // "Dismiss is the gentle send-away" (2026-05-02).
+    static bool HandleReleaseCommand(ChatHandler* handler, char const* args)
     {
         Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
         if (!player)
@@ -373,14 +439,17 @@ public:
         std::string raw = args ? args : "";
         if (raw.empty())
         {
-            handler->SendSysMessage("Usage: .merc dismiss <name> [force]");
+            handler->SendSysMessage("Usage: .merc release <name> [force]");
+            handler->SendSysMessage("WARNING: permanently deletes the merc + all gear.");
+            handler->SendSysMessage("To send a merc home recoverably, use '.merc dismiss <name>'.");
             return true;
         }
 
         // Parse optional trailing 'force' keyword used to override the
-        // pending-mail guard. Mercs never auto-process mail (they always have
-        // a master, so CheckMailAction skips), and DismissMerc cascades through
-        // Player::DeleteFromDB which silently nukes the mail + items.
+        // pending-mail guard. Mercs never auto-process mail (they always
+        // have a master, so CheckMailAction skips), and DismissMerc
+        // cascades through Player::DeleteFromDB which silently nukes
+        // mail + items.
         bool force = false;
         std::string name = raw;
         std::size_t space = raw.rfind(' ');
@@ -417,34 +486,14 @@ public:
             uint32 mailCount = mailRes ? mailRes->Fetch()[0].Get<uint32>() : 0;
             if (mailCount > 0)
             {
-                handler->PSendSysMessage("'{}' has {} pending mail item(s) — they will be lost on dismiss.", name, mailCount);
-                handler->PSendSysMessage("Use '.merc dismiss {} force' to confirm.", name);
+                handler->PSendSysMessage("'{}' has {} pending mail item(s) — they will be lost on release.", name, mailCount);
+                handler->PSendSysMessage("Use '.merc release {} force' to confirm.", name);
                 return true;
             }
         }
 
         sMercenaryMgr.DismissMerc(mercGuid);
-        handler->PSendSysMessage("Dismissed mercenary '{}'.", name);
-        return true;
-    }
-
-    static bool HandleDismissAllCommand(ChatHandler* handler, char const* /*args*/)
-    {
-        Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
-        if (!player)
-            return false;
-
-        std::vector<ObjectGuid> mercs = sMercenaryMgr.GetMercsForOwner(player->GetGUID());
-        if (mercs.empty())
-        {
-            handler->SendSysMessage("You have no mercenaries to dismiss.");
-            return true;
-        }
-
-        for (ObjectGuid mercGuid : mercs)
-            sMercenaryMgr.DismissMerc(mercGuid);
-
-        handler->PSendSysMessage("Dismissed {} mercenary(s).", mercs.size());
+        handler->PSendSysMessage("Released mercenary '{}' (character + items deleted).", name);
         return true;
     }
 
