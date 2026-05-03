@@ -75,30 +75,68 @@ namespace Sbywow
 
     void SbywowAgentEngine::addStrategy(std::string const name, bool init)
     {
-        // Allowlist: only the packet-handler "default" strategy is
-        // ever installed in this engine. Class-specific combat-prep
-        // strategies (dps assist / cure / tank assist), follow,
-        // quest, gather, chat, emote, loot, duel, mount, food, buff,
-        // pvp — all rejected. The agent harness drives these via
-        // bridge intents (move_to / interact_with / do_action / say).
+        // Two channels:
+        //   1. "default" packet-handler glue lives on US and is immutable
+        //      — that's what keeps the bot ticking at all. PlayerbotAI's
+        //      ResetStrategies adds it during login / SetMaster / etc.,
+        //      and we accept those.
+        //   2. Everything else (cognitive strategies — follow, grind,
+        //      rpg, quest, gather, kite, etc.) gets FORWARDED to our
+        //      wrapped defaultEngine_. That engine actually iterates
+        //      strategies on every tick (when we delegate to it under
+        //      agent_mode=off, in-combat, or idle-follow). Without
+        //      forwarding, agent-issued `add_strategy grind` would
+        //      silently no-op because our DoNextAction doesn't tick
+        //      the strategy stack.
         //
-        // This filter survives PlayerbotAI::ResetStrategies invocations
-        // — login, SetMaster, group invite accept, LFG events, talent
-        // change, etc. — because all those paths re-enter this method
-        // through the virtual dispatch from base ResetStrategies code.
-        // The reassertion problem that drove the architectural pivot
-        // is closed at the strategy-add level.
+        // ResetStrategies-driven re-adds (login, SetMaster, etc.) hit
+        // this same path and forward into defaultEngine_, which is
+        // already populated with the default merc stack from our
+        // constructor. Re-adding an already-present strategy is a
+        // no-op in the base Engine, so this is idempotent.
         if (name == "default")
         {
             Engine::addStrategy(name, init);
             return;
         }
-        // Quietly drop. LOG_DEBUG so we can audit if needed; not a
-        // warning because upstream ResetStrategies legitimately tries
-        // to add ~15 strategies every time it fires and that's by
-        // design — no consumer needs to know it was filtered.
-        LOG_DEBUG("playerbots",
-                  "[SbywowAgentEngine] filtered strategy add: '{}'", name.c_str());
+        if (defaultEngine_)
+        {
+            defaultEngine_->addStrategy(name, init);
+            LOG_DEBUG("playerbots",
+                      "[SbywowAgentEngine] forwarded addStrategy '{}' → defaultEngine_",
+                      name.c_str());
+            return;
+        }
+        // No defaultEngine_ — only happens during teardown. Drop quietly.
+    }
+
+    bool SbywowAgentEngine::removeStrategy(std::string const name, bool init)
+    {
+        // "default" on us is immutable — removing it would silence packet
+        // handling. Forward all other names to defaultEngine_.
+        if (name == "default")
+            return false;
+        return defaultEngine_ ? defaultEngine_->removeStrategy(name, init) : false;
+    }
+
+    bool SbywowAgentEngine::HasStrategy(std::string const name)
+    {
+        // The "what's actually running" query — reads defaultEngine_'s
+        // stack. Our own stack only contains "default", which isn't
+        // interesting for the agent's mode-detection use cases.
+        return defaultEngine_ ? defaultEngine_->HasStrategy(name) : false;
+    }
+
+    std::vector<std::string> SbywowAgentEngine::GetStrategies()
+    {
+        return defaultEngine_ ? defaultEngine_->GetStrategies() : std::vector<std::string>{};
+    }
+
+    void SbywowAgentEngine::ChangeStrategy(std::string const names)
+    {
+        // Forward the +foo,-bar,~baz comma syntax to defaultEngine_.
+        if (defaultEngine_)
+            defaultEngine_->ChangeStrategy(names);
     }
 
     namespace

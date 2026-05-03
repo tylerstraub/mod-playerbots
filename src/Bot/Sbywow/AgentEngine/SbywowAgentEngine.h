@@ -63,6 +63,21 @@ namespace Sbywow
         // quest, gather, chat, emote, loot, duel, class strategies)
         // gets dropped silently. The agent harness owns those decisions.
         void addStrategy(std::string const name, bool init = true) override;
+        // Strategy-op forwarders. Reads (HasStrategy / GetStrategies) and
+        // mutations (removeStrategy / ChangeStrategy) target the wrapped
+        // defaultEngine_, which is the engine that actually ticks
+        // strategies for agent-bonded bots. Our own engine has only the
+        // "default" packet-handler glue and doesn't iterate strategies
+        // at all — see DoNextAction. Without this forwarding the bridge's
+        // strategy verbs would be no-ops on agent-mode bots, which was
+        // the bug surfaced 2026-05-03 ("can the agent set Claude into
+        // grinding mode?"). The "default" packet-handler entry on us is
+        // immutable: removeStrategy("default") is rejected to keep our
+        // packet plumbing alive.
+        bool removeStrategy(std::string const name, bool init = true) override;
+        bool HasStrategy(std::string const name) override;
+        std::vector<std::string> GetStrategies() override;
+        void ChangeStrategy(std::string const names) override;
 
         // Execute a single Intent against the bot. Returns the JSON
         // string the HTTP-side verb will respond with. Public so the

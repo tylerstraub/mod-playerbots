@@ -74,15 +74,18 @@ public:
     virtual void addStrategy(std::string const name, bool init = true);
     void addStrategies(std::string first, ...);
     void addStrategiesNoInit(std::string first, ...);
-    bool removeStrategy(std::string const name, bool init = true);
-    bool HasStrategy(std::string const name);
+    // Sbywow note: virtual so SbywowAgentEngine can forward strategy
+    // ops to its wrapped defaultEngine_, which is what actually ticks
+    // strategies for agent-bonded bots. See SbywowAgentEngine.cpp.
+    virtual bool removeStrategy(std::string const name, bool init = true);
+    virtual bool HasStrategy(std::string const name);
     Strategy* GetStrategy(std::string const name);
     void removeAllStrategies();
     void toggleStrategy(std::string const name);
     std::string const ListStrategies();
-    std::vector<std::string> GetStrategies();
+    virtual std::vector<std::string> GetStrategies();
     bool ContainsStrategy(StrategyType type);
-    void ChangeStrategy(std::string const names);
+    virtual void ChangeStrategy(std::string const names);
     std::string const GetLastAction() { return lastAction; }
 
     virtual bool DoNextAction(Unit*, uint32 depth = 0, bool minimal = false);
