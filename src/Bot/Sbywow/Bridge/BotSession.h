@@ -87,6 +87,13 @@ namespace Sbywow::Bridge
         // queue is dropped on detach.
         void   PushIntent(std::shared_ptr<PendingIntent> pending);
         bool   PopIntent(std::shared_ptr<PendingIntent>& out);
+        // Peek at the head of the queue WITHOUT removing. Used by
+        // DoNextAction's "is the next intent blocking?" check —
+        // engine peeks, decides whether the in-flight slot situation
+        // permits dispatch, then pops. Safe under the same world-
+        // thread invariant that pops live on (peek and pop run on the
+        // same thread; HTTP-side pushes append to the back).
+        std::shared_ptr<PendingIntent> PeekIntent() const;
         size_t IntentCount() const;
 
         // Snapshot the queue contents for the context block's

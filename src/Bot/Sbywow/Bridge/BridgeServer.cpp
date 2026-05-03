@@ -30,6 +30,7 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "SharedDefines.h"
+#include "Spell.h"
 #include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
@@ -710,10 +711,11 @@ namespace Sbywow::Bridge
                 ItemTemplate const* tpl = it->GetTemplate();
                 if (!tpl) continue;
                 equipped[kEquipSlotName[i]] = {
-                    {"entry",   tpl->ItemId},
-                    {"name",    tpl->Name1},
-                    {"ilvl",    tpl->ItemLevel},
-                    {"quality", QualityName(tpl->Quality)}
+                    {"entry",     tpl->ItemId},
+                    {"name",      tpl->Name1},
+                    {"ilvl",      tpl->ItemLevel},
+                    {"quality",   QualityName(tpl->Quality)},
+                    {"item_guid", it->GetGUID().GetRawValue()}
                 };
             }
 
@@ -963,6 +965,26 @@ namespace Sbywow::Bridge
                                         agentEng->MovingTargetZ()}},
                 {"distance_remaining", dist}
             });
+        }
+        if (agentEng && agentEng->IsCasting())
+        {
+            uint32 spellId = agentEng->CastingSpellId();
+            json one = {
+                {"intent_id",   std::to_string(agentEng->CastingIntentId())},
+                {"verb",        agentEng->CastingIntentVerb()},
+                {"kind",        "cast"},
+                {"status",      "in_flight"},
+                {"spell_id",    spellId}
+            };
+            if (Spell* live = bot->FindCurrentSpellBySpellId(spellId))
+            {
+                one["remaining_ms"] = live->GetCastTimeRemaining();
+            }
+            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+            {
+                one["spell_name"] = si->SpellName[0] ? si->SpellName[0] : "";
+            }
+            activeIntents.push_back(std::move(one));
         }
         for (auto const& iv : sess.ProjectIntents())
         {
@@ -1438,13 +1460,16 @@ namespace Sbywow::Bridge
                                        std::shared_ptr<PendingCommand>& cmd,
                                        json const& req)
         {
-            if (!req.contains("item_guid") || !req["item_guid"].is_number())
-                return json{{"ok", false}, {"error", "use_item requires item_guid"}}.dump();
+            bool hasGuid  = req.contains("item_guid")  && req["item_guid"].is_number();
+            bool hasEntry = req.contains("item_entry") && req["item_entry"].is_number();
+            if (!hasGuid && !hasEntry)
+                return json{{"ok", false}, {"error", "use_item requires item_guid or item_entry"}}.dump();
             Sbywow::Intent i;
-            i.kind     = Sbywow::IntentKind::UseItem;
-            i.itemGuid = req["item_guid"].get<uint64_t>();
-            i.guid     = req.contains("target_guid") && req["target_guid"].is_number()
-                         ? req["target_guid"].get<uint64_t>() : 0;
+            i.kind      = Sbywow::IntentKind::UseItem;
+            i.itemGuid  = hasGuid  ? req["item_guid"].get<uint64_t>()  : 0;
+            i.itemEntry = hasEntry ? req["item_entry"].get<uint32_t>() : 0;
+            i.guid      = req.contains("target_guid") && req["target_guid"].is_number()
+                          ? req["target_guid"].get<uint64_t>() : 0;
             return Defer(bot, sess, cmd, "use_item", std::move(i));
         }
 
@@ -2234,6 +2259,11 @@ namespace Sbywow::Bridge
                     {
                         cancelState   = "interrupted";
                         cancelledVerb = "move_to";
+                    }
+                    else if (agentEng && agentEng->CancelInFlightCastIfMatch(id))
+                    {
+                        cancelState   = "interrupted";
+                        cancelledVerb = agentEng->CastingIntentVerb();
                     }
                 }
 

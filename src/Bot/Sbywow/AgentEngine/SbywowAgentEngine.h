@@ -43,6 +43,12 @@ class Unit;
 
 namespace Sbywow
 {
+    namespace Bridge
+    {
+        class BotSession;
+        struct PendingIntent;
+    }
+
     class SbywowAgentEngine : public Engine
     {
     public:
@@ -80,6 +86,12 @@ namespace Sbywow
         // in-flight Move clears the generator and reports cancelled.
         bool CancelInFlightMoveIfMatch(uint64_t intentId);
 
+        // Same shape, for an in-flight Cast intent (cast_spell /
+        // use_item / mount). Locates the live Spell* via
+        // FindCurrentSpellBySpellId and calls Spell::cancel(),
+        // which interrupts the cast and clears m_currentSpells.
+        bool CancelInFlightCastIfMatch(uint64_t intentId);
+
         // ---- Observability accessors -----------------------------
         //
         // Read-only views into engine state for inspect / snapshot.
@@ -105,6 +117,17 @@ namespace Sbywow
         float       MovingTargetY()        const { return inFlightMoveY_; }
         float       MovingTargetZ()        const { return inFlightMoveZ_; }
 
+        // In-flight Cast accessors. Same shape as Move: while
+        // inFlightCast_ is true the engine is holding a cast intent
+        // (cast_spell / use_item / mount) across ticks, polling
+        // m_currentSpells for completion / interruption. Lets the
+        // agent observe "I'm currently casting X with N ms left"
+        // via context.active_intents.
+        bool        IsCasting()            const { return inFlightCast_; }
+        uint64_t    CastingIntentId()      const { return inFlightCastIntentId_; }
+        std::string const& CastingIntentVerb() const { return inFlightCastVerb_; }
+        uint32_t    CastingSpellId()       const { return inFlightCastSpellId_; }
+
         uint64_t    TicksTotal()              const { return ticksTotal_; }
         uint64_t    IntentsDispatchedTotal()  const { return intentsDispatchedTotal_; }
         uint64_t    ReactivesFiredTotal()     const { return reactivesFiredTotal_; }
@@ -123,6 +146,39 @@ namespace Sbywow
         uint64_t    DefaultEngineTicksTotal()      const { return defaultEngineTicksTotal_; }
 
     private:
+        // Per-tick poll helpers — examine in-flight slot state, emit
+        // terminal events when the slot resolves, clear the slot.
+        // Both fall through (no return) when the slot is still
+        // active — non-blocking intents in the queue can drain in
+        // parallel with in-flight moves and casts.
+        void PollInFlightMove(Player* bot,
+                              std::shared_ptr<Sbywow::Bridge::BotSession> const& session);
+        void PollInFlightCast(Player* bot,
+                              std::shared_ptr<Sbywow::Bridge::BotSession> const& session);
+
+        // Per-kind dispatchers used by DoNextAction's queue drain.
+        // DispatchMoveIntent / DispatchCastIntent return true if they
+        // dispatched (whether they set the in-flight slot or emitted
+        // a terminal inline). DispatchInstantIntent always emits
+        // terminal inline.
+        bool DispatchMoveIntent(Player* bot,
+                                std::shared_ptr<Sbywow::Bridge::BotSession> const& session,
+                                std::shared_ptr<Sbywow::Bridge::PendingIntent> const& pending);
+        bool DispatchCastIntent(Player* bot,
+                                std::shared_ptr<Sbywow::Bridge::BotSession> const& session,
+                                std::shared_ptr<Sbywow::Bridge::PendingIntent> const& pending);
+        void DispatchInstantIntent(Player* bot,
+                                   std::shared_ptr<Sbywow::Bridge::BotSession> const& session,
+                                   std::shared_ptr<Sbywow::Bridge::PendingIntent> const& pending);
+
+        // Classifier used at queue-peek time. Move + Wait + cast-time
+        // (or channeled) Cast/UseItem/Mount = blocking; everything
+        // else (Say, Interact, instant Cast, Buy, Sell, etc.) =
+        // non-blocking. Cast classification reads spellInfo's cast
+        // time, which means looking up the spell (and for use_item,
+        // the item's on-use spell first).
+        bool IsBlockingIntent(Player* bot, Intent const& intent);
+
         std::string ExecuteMove    (Player* bot, Intent const& intent);
         std::string ExecuteInteract(Player* bot, Intent const& intent);
         std::string ExecuteSay     (Player* bot, Intent const& intent);
@@ -211,6 +267,25 @@ namespace Sbywow
         // generate (forceDestination=false) and never fire arrival;
         // 60s is generous for any reasonable trip on a single map.
         static constexpr int64_t               kMoveTimeoutMs = 60000;
+
+        // Multi-tick Cast state. Mirror of inFlightMove_. Dispatched
+        // by ExecuteCastSpell / ExecuteUseItem / ExecuteMount when the
+        // cast goes into m_currentSpells (cast-time, channeled, or
+        // mount). Instant casts terminate inline at dispatch and
+        // never set this. Polled in DoNextAction: when
+        // FindCurrentSpellBySpellId returns null, the cast finished
+        // (cooldown started → completed) or was interrupted
+        // (no cooldown → failed/interrupted).
+        bool                                   inFlightCast_         = false;
+        uint64_t                               inFlightCastIntentId_ = 0;
+        std::string                            inFlightCastVerb_;
+        uint32_t                               inFlightCastSpellId_  = 0;
+        std::chrono::steady_clock::time_point  inFlightCastDispatchAt_;
+        // Hard timeout — any spell taking more than 30s to resolve
+        // is suspicious (longest non-channel cast in WoW 3.3.5 is
+        // Hearthstone at 10s; channels can be longer but resolve
+        // via natural channel-end, not timeout).
+        static constexpr int64_t               kCastTimeoutMs = 30000;
 
         // Cumulative counters surfaced via inspect for "is the engine
         // ticking? are intents flowing?" sanity. World-thread only;

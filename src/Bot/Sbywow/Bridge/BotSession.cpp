@@ -51,6 +51,14 @@ namespace Sbywow::Bridge
         return true;
     }
 
+    std::shared_ptr<PendingIntent> BotSession::PeekIntent() const
+    {
+        std::lock_guard<std::mutex> lock(intentMutex_);
+        if (intents_.empty())
+            return nullptr;
+        return intents_.front();
+    }
+
     size_t BotSession::IntentCount() const
     {
         std::lock_guard<std::mutex> lock(intentMutex_);
@@ -68,11 +76,40 @@ namespace Sbywow::Bridge
             char const* kindName = "unknown";
             switch (p->intent.kind)
             {
-                case Sbywow::IntentKind::Move:     kindName = "move";       break;
-                case Sbywow::IntentKind::Interact: kindName = "interact";   break;
-                case Sbywow::IntentKind::Say:      kindName = "say";        break;
-                case Sbywow::IntentKind::DoAction: kindName = "do_action";  break;
-                case Sbywow::IntentKind::Wait:     kindName = "wait";       break;
+                case Sbywow::IntentKind::Move:                   kindName = "move";       break;
+                case Sbywow::IntentKind::Interact:               kindName = "interact";   break;
+                case Sbywow::IntentKind::Say:                    kindName = "say";        break;
+                case Sbywow::IntentKind::DoAction:               kindName = "do_action";  break;
+                case Sbywow::IntentKind::Wait:                   kindName = "wait";       break;
+                case Sbywow::IntentKind::BuyItem:                kindName = "buy_item"; break;
+                case Sbywow::IntentKind::SellItem:               kindName = "sell_item"; break;
+                case Sbywow::IntentKind::SelectGossipOption:     kindName = "select_gossip_option"; break;
+                case Sbywow::IntentKind::TradeInitiate:          kindName = "trade_initiate"; break;
+                case Sbywow::IntentKind::TradeOfferItem:         kindName = "trade_offer_item"; break;
+                case Sbywow::IntentKind::TradeOfferMoney:        kindName = "trade_offer_money"; break;
+                case Sbywow::IntentKind::TradeAccept:            kindName = "trade_accept"; break;
+                case Sbywow::IntentKind::TradeCancel:            kindName = "trade_cancel"; break;
+                case Sbywow::IntentKind::EquipItem:              kindName = "equip_item"; break;
+                case Sbywow::IntentKind::UnequipItem:            kindName = "unequip_item"; break;
+                case Sbywow::IntentKind::DestroyItem:            kindName = "destroy_item"; break;
+                case Sbywow::IntentKind::UseItem:                kindName = "use_item"; break;
+                case Sbywow::IntentKind::CastSpell:              kindName = "cast_spell"; break;
+                case Sbywow::IntentKind::Mount:                  kindName = "mount"; break;
+                case Sbywow::IntentKind::Dismount:               kindName = "dismount"; break;
+                case Sbywow::IntentKind::InteractGameObject:     kindName = "interact_gameobject"; break;
+                case Sbywow::IntentKind::LootTarget:             kindName = "loot_target"; break;
+                case Sbywow::IntentKind::MailSend:               kindName = "mail_send"; break;
+                case Sbywow::IntentKind::MailTakeItem:           kindName = "mail_take_item"; break;
+                case Sbywow::IntentKind::MailTakeMoney:          kindName = "mail_take_money"; break;
+                case Sbywow::IntentKind::QuestAccept:            kindName = "quest_accept"; break;
+                case Sbywow::IntentKind::QuestComplete:          kindName = "quest_complete"; break;
+                case Sbywow::IntentKind::QuestAbandon:           kindName = "quest_abandon"; break;
+                case Sbywow::IntentKind::QuestShare:             kindName = "quest_share"; break;
+                case Sbywow::IntentKind::GroupAcceptInvite:      kindName = "group_accept_invite"; break;
+                case Sbywow::IntentKind::GroupDeclineInvite:     kindName = "group_decline_invite"; break;
+                case Sbywow::IntentKind::GroupLeave:             kindName = "group_leave"; break;
+                case Sbywow::IntentKind::GroupPromoteLeader:     kindName = "group_promote_leader"; break;
+                case Sbywow::IntentKind::GroupReadyCheckRespond: kindName = "group_ready_check_respond"; break;
             }
             out.push_back(IntentView{ p->intentId, p->verb, kindName });
         }

@@ -24,6 +24,7 @@
 #include "Opcodes.h"
 #include "Player.h"
 #include "QuestDef.h"
+#include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "TradeData.h"
@@ -178,102 +179,26 @@ namespace Sbywow
             return defaultEngine_->DoNextAction(target, depth, minimal);
         }
 
-        // Multi-tick Move: if a move was dispatched on a prior tick,
-        // poll arrival / path failure / timeout. While the move is
-        // active we return false outright — no queue drain, no idle
-        // delegation. This is the mechanism that prevents the
-        // default engine's FollowAction from running and replacing
-        // the bot's MotionMaster (which used to clobber agent moves
-        // and was the original motivation for the engine pivot).
-        if (inFlightMove_)
-        {
-            float dist2d = bot->GetExactDist2d(inFlightMoveX_, inFlightMoveY_);
-            bool  arrived = dist2d <= kMoveArrivalThreshold;
-            auto  elapsed = std::chrono::steady_clock::now() - inFlightMoveDispatchAt_;
-            bool  timedOut = elapsed > std::chrono::milliseconds(kMoveTimeoutMs);
+        // Poll the multi-tick blocking slots. Each may emit a terminal
+        // event (intent_completed or intent_failed) and clear the
+        // slot. After polling, if the slot is still set, the intent
+        // is still in-flight — but we still fall through to the
+        // queue-drain stage so non-blocking intents (instant casts,
+        // Say, Interact, Buy, etc.) can run in parallel with the
+        // in-flight blocking work. This mirrors real WoW where you
+        // can /say or fire instant-cast spells while moving.
+        PollInFlightMove(bot, session);
+        PollInFlightCast(bot, session);
 
-            // Check if MotionMaster's active generator is still our
-            // MovePoint. If something replaced it (FollowAction in a
-            // delegated path, charm, knockback, etc.) we treat the
-            // move as failed — the agent didn't get where it asked.
-            MotionMaster* mm = bot->GetMotionMaster();
-            bool generatorActive = mm &&
-                mm->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
-
-            if (arrived)
-            {
-                if (session)
-                {
-                    json result = {
-                        {"ok",       true},
-                        {"verb",     "move_to"},
-                        {"arrived",  true},
-                        {"position", {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
-                        {"distance", dist2d}
-                    };
-                    json ev = BuildIntentEvent(bot, "intent_completed",
-                                               inFlightMoveIntentId_, inFlightMoveVerb_);
-                    ev["result"] = result;
-                    session->PushOutbound(ev.dump());
-
-                    Sbywow::Bridge::BotSession::TerminalIntent rec;
-                    rec.intentId   = inFlightMoveIntentId_;
-                    rec.verb       = inFlightMoveVerb_;
-                    rec.kind       = "intent_completed";
-                    rec.resultJson = result.dump();
-                    session->RecordTerminal(std::move(rec));
-                }
-                inFlightMove_ = false;
-                inFlightMoveIntentId_ = 0;
-                inFlightMoveVerb_.clear();
-                // Fall through to wait/queue handling below.
-            }
-            else if (!generatorActive || timedOut)
-            {
-                if (session)
-                {
-                    json result = {
-                        {"ok",       false},
-                        {"verb",     "move_to"},
-                        {"error",    timedOut ? "move timeout" :
-                                                 "move generator replaced or path failed"},
-                        {"position", {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
-                        {"target",   {inFlightMoveX_, inFlightMoveY_, inFlightMoveZ_}},
-                        {"distance", dist2d}
-                    };
-                    json ev = BuildIntentEvent(bot, "intent_failed",
-                                               inFlightMoveIntentId_, inFlightMoveVerb_);
-                    ev["result"] = result;
-                    session->PushOutbound(ev.dump());
-
-                    Sbywow::Bridge::BotSession::TerminalIntent rec;
-                    rec.intentId   = inFlightMoveIntentId_;
-                    rec.verb       = inFlightMoveVerb_;
-                    rec.kind       = "intent_failed";
-                    rec.resultJson = result.dump();
-                    session->RecordTerminal(std::move(rec));
-                }
-                inFlightMove_ = false;
-                inFlightMoveIntentId_ = 0;
-                inFlightMoveVerb_.clear();
-                // Fall through.
-            }
-            else
-            {
-                // Still moving — preempts queue + idle delegation.
-                return false;
-            }
-        }
-
-        // Wait suspension: while engaged, no intents drain. Wait is
-        // explicit agent-issued sequencing — "do A, hold for N ms,
-        // then do B" — implemented as a pause on intent dispatch.
-        // Chained intents queue behind it until suspension lifts.
-        // Uses steady_clock to avoid getMSTime's uint32 wraparound.
+        // Wait keeps its original universal-pause semantic — when
+        // the agent says "wait N ms," the entire plan halts. No
+        // intents drain, including non-blocking ones. This is
+        // explicit sequencing behavior the agent issued; we don't
+        // sneak instant casts through it.
         if (isWaiting_)
         {
             if (std::chrono::steady_clock::now() < waitUntil_)
-                return false;  // still waiting
+                return false;  // still waiting — universal pause
             isWaiting_ = false;
 
             // Wait reached its end naturally — emit intent_completed
@@ -300,34 +225,90 @@ namespace Sbywow
             waitingIntentVerb_.clear();
         }
 
-        // Pop one intent per tick from the per-bot session queue,
-        // execute it, emit the corresponding SSE intent_* event.
-        // BridgeServer is the canonical owner of sessions; if the
-        // bridge is down or the session was detached out from under
-        // us, we silently no-op (intent is implicitly cancelled).
         if (!session)
             return false;
 
-        std::shared_ptr<Sbywow::Bridge::PendingIntent> pending;
-        if (!session->PopIntent(pending))
+        // Drain the queue. Non-blocking intents fire inline same tick
+        // and we keep draining; a blocking intent (Move, cast-time
+        // Cast/UseItem/Mount) takes the head slot for one tick and
+        // we stop. While ANY blocking slot is occupied (move or cast
+        // in flight), we still drain non-blocking intents.
+        bool didWork = false;
+        while (true)
         {
-            // Idle tick. Two paths:
-            //
-            // 1. follow_mode ON (default): delegate to the default
-            //    engine. Bot follows master at idle, runs the upstream
-            //    react / autonomic / eat-drink strategies. Agent
-            //    intents preempt this naturally — having an intent in
-            //    the queue (or an in-flight Move, or an active Wait)
-            //    means we never reach this branch.
-            //
-            // 2. follow_mode OFF: anchor in place. Agent has
-            //    explicitly opted out of follow ("camp here
-            //    indefinitely"). We still run our own reactive
-            //    eat/drink so a long anchor doesn't leave the bot
-            //    starving — autonomic is reflex, not "follow."
-            //
-            // See decisions.md "Idle delegation + follow toggle"
-            // (2026-05-02) for the design.
+            auto pending = session->PeekIntent();
+            if (!pending)
+                break;
+
+            bool blocking = IsBlockingIntent(bot, pending->intent);
+            bool slotsFree = !inFlightMove_ && !inFlightCast_;
+
+            if (blocking && !slotsFree)
+                break;  // blocking intent waiting on slot to clear
+
+            // Commit to dispatching this one. Pop atomically — peek
+            // and pop run on the same world thread, no other puller.
+            std::shared_ptr<Sbywow::Bridge::PendingIntent> popped;
+            session->PopIntent(popped);
+
+            // intent_started fires before any executor runs; gives
+            // the harness a clean before-dispatch marker.
+            {
+                json ev = BuildIntentEvent(bot, "intent_started",
+                                           popped->intentId, popped->verb);
+                session->PushOutbound(ev.dump());
+            }
+            ++intentsDispatchedTotal_;
+            didWork = true;
+
+            // Wait — arm the suspension and stop draining (Wait is
+            // universal-pause; no further intents until it lifts).
+            if (popped->intent.kind == IntentKind::Wait)
+            {
+                isWaiting_         = true;
+                waitUntil_         = std::chrono::steady_clock::now() +
+                                     std::chrono::milliseconds(popped->intent.waitMs);
+                waitingIntentId_   = popped->intentId;
+                waitingIntentVerb_ = popped->verb;
+                return true;
+            }
+
+            // Move — sub-tick dispatch + multi-tick hold via
+            // inFlightMove_. Same shape as before. Stop draining
+            // after setting the slot (one blocking dispatch per tick).
+            if (popped->intent.kind == IntentKind::Move)
+            {
+                if (DispatchMoveIntent(bot, session, popped))
+                    return true;  // either set slot or emitted failed
+                continue;          // unreachable, defensive
+            }
+
+            // Cast verbs — sub-tick dispatch; the executor decides if
+            // the cast is in-flight (cast-time/channeled) or
+            // terminated inline (instant). DispatchCastIntent
+            // handles slot setup OR terminal emit accordingly.
+            if (popped->intent.kind == IntentKind::CastSpell ||
+                popped->intent.kind == IntentKind::UseItem   ||
+                popped->intent.kind == IntentKind::Mount)
+            {
+                bool inflight = DispatchCastIntent(bot, session, popped);
+                if (inflight)
+                    return true;  // slot set; stop draining (one blocking per tick)
+                // Else terminated inline; continue to drain more.
+                continue;
+            }
+
+            // All other verbs are non-blocking sub-tick:
+            // ExecuteIntent runs synchronously, terminal fires inline.
+            DispatchInstantIntent(bot, session, popped);
+            // Continue draining — non-blocking intents chain inside
+            // a single tick.
+        }
+
+        // Queue empty (or only blocking intents waiting on slots).
+        // Idle delegation only fires when nothing is in flight either.
+        if (!didWork && !inFlightMove_ && !inFlightCast_ && !isWaiting_)
+        {
             if (session->IsFollowMode() && defaultEngine_)
             {
                 ++defaultEngineTicksTotal_;
@@ -337,110 +318,333 @@ namespace Sbywow
             return false;
         }
 
-        // intent_started fires the moment we commit to executing a
-        // popped intent. For sub-tick verbs (Move/Interact/Say/
-        // DoAction) intent_completed lands in the same tick; for
-        // Wait it lands when the suspension expires. Emit before the
-        // dispatch so a slow ExecuteIntent (find_nearby-class work)
-        // doesn't reorder against completed.
-        {
-            json ev = BuildIntentEvent(bot, "intent_started",
-                                       pending->intentId, pending->verb);
-            session->PushOutbound(ev.dump());
-        }
+        return didWork;
+    }
 
-        // Count the dispatch — covers all five kinds (Wait included,
-        // since arming the suspension is itself a dispatch).
-        ++intentsDispatchedTotal_;
+    // ---- Blocking-intent classifier ----------------------------------
+    //
+    // The queue drain in DoNextAction asks "can this intent fire while
+    // a blocking slot (Move/Cast) is occupied?" Non-blocking intents
+    // run inline same tick and don't compete with in-flight work. A
+    // cast intent's blocking-ness depends on whether the resolved
+    // spell has a cast time > 0 (cast-time / channeled) or 0 (instant).
 
-        // Wait is special-cased: arm the suspension. Subsequent
-        // intents in the queue wait their turn until suspension
-        // lifts in a future tick (where intent_completed fires).
-        if (pending->intent.kind == IntentKind::Wait)
+    bool SbywowAgentEngine::IsBlockingIntent(Player* bot, Intent const& intent)
+    {
+        switch (intent.kind)
         {
-            isWaiting_         = true;
-            waitUntil_         = std::chrono::steady_clock::now() +
-                                 std::chrono::milliseconds(pending->intent.waitMs);
-            waitingIntentId_   = pending->intentId;
-            waitingIntentVerb_ = pending->verb;
-            return true;
-        }
-
-        // Move is also special-cased: dispatch the MovePoint into
-        // the MotionMaster (sub-tick), then HOLD the intent in our
-        // in-flight slot. The terminal event (intent_completed on
-        // arrival, intent_failed on path-replaced/timeout) fires from
-        // the multi-tick poll at the top of DoNextAction. While the
-        // move is in-flight, follow / queue-drain / idle delegation
-        // are all blocked — that's how the agent's move trajectory
-        // gets to complete without FollowAction yanking it back.
-        //
-        // Pre-dispatch validation (map mismatch, can't move,
-        // missing motion master) still fires intent_failed on the
-        // same tick like other sub-tick verbs, since no MovePoint
-        // was armed.
-        if (pending->intent.kind == IntentKind::Move)
-        {
-            std::string outStr = ExecuteMove(bot, pending->intent);
-            json result;
-            try { result = json::parse(outStr); }
-            catch (std::exception const&) {
-                result = {{"ok", false}, {"error", "engine returned non-JSON"}};
-            }
-            bool ok = result.value("ok", false);
-            if (!ok)
+            case IntentKind::Move:
+            case IntentKind::Wait:
+                return true;
+            case IntentKind::CastSpell:
             {
-                json ev = BuildIntentEvent(bot, "intent_failed",
-                                           pending->intentId, pending->verb);
+                if (!intent.spellId)
+                    return false;  // will fail at dispatch with clear error
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(intent.spellId);
+                if (!si) return false;
+                return si->CalcCastTime() > 0 || si->IsChanneled();
+            }
+            case IntentKind::UseItem:
+            {
+                Item* item = nullptr;
+                if (intent.itemGuid)
+                    item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+                else if (intent.itemEntry)
+                    item = bot->GetItemByEntry(intent.itemEntry);
+                if (!item) return false;
+                ItemTemplate const* tpl = item->GetTemplate();
+                if (!tpl) return false;
+                for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+                {
+                    if (tpl->Spells[i].SpellId != 0 &&
+                        tpl->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE)
+                    {
+                        SpellInfo const* si = sSpellMgr->GetSpellInfo(tpl->Spells[i].SpellId);
+                        if (!si) return false;
+                        return si->CalcCastTime() > 0 || si->IsChanneled();
+                    }
+                }
+                return false;
+            }
+            case IntentKind::Mount:
+            {
+                if (intent.spellId)
+                {
+                    SpellInfo const* si = sSpellMgr->GetSpellInfo(intent.spellId);
+                    return si && (si->CalcCastTime() > 0 || si->IsChanneled());
+                }
+                // Auto-pick path: most mounts are 1.5s cast in WoW
+                // 3.3.5 — assume blocking.
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+
+    // ---- In-flight Move polling --------------------------------------
+    //
+    // When inFlightMove_ is set, check arrival / path-replaced /
+    // timeout each tick and emit terminal when one fires. Falls back
+    // (no return) so the queue drain can run non-blocking intents in
+    // parallel with the move.
+
+    void SbywowAgentEngine::PollInFlightMove(Player* bot, std::shared_ptr<Sbywow::Bridge::BotSession> const& session)
+    {
+        if (!inFlightMove_)
+            return;
+        float dist2d = bot->GetExactDist2d(inFlightMoveX_, inFlightMoveY_);
+        bool  arrived = dist2d <= kMoveArrivalThreshold;
+        auto  elapsed = std::chrono::steady_clock::now() - inFlightMoveDispatchAt_;
+        bool  timedOut = elapsed > std::chrono::milliseconds(kMoveTimeoutMs);
+
+        MotionMaster* mm = bot->GetMotionMaster();
+        bool generatorActive = mm &&
+            mm->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
+
+        if (arrived)
+        {
+            if (session)
+            {
+                json result = {
+                    {"ok",       true},
+                    {"verb",     "move_to"},
+                    {"arrived",  true},
+                    {"position", {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
+                    {"distance", dist2d}
+                };
+                json ev = BuildIntentEvent(bot, "intent_completed",
+                                           inFlightMoveIntentId_, inFlightMoveVerb_);
                 ev["result"] = result;
                 session->PushOutbound(ev.dump());
 
+                Sbywow::Bridge::BotSession::TerminalIntent rec;
+                rec.intentId   = inFlightMoveIntentId_;
+                rec.verb       = inFlightMoveVerb_;
+                rec.kind       = "intent_completed";
+                rec.resultJson = result.dump();
+                session->RecordTerminal(std::move(rec));
+            }
+            inFlightMove_ = false;
+            inFlightMoveIntentId_ = 0;
+            inFlightMoveVerb_.clear();
+        }
+        else if (!generatorActive || timedOut)
+        {
+            if (session)
+            {
+                json result = {
+                    {"ok",       false},
+                    {"verb",     "move_to"},
+                    {"error",    timedOut ? "move timeout" :
+                                            "move generator replaced or path failed"},
+                    {"position", {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
+                    {"target",   {inFlightMoveX_, inFlightMoveY_, inFlightMoveZ_}},
+                    {"distance", dist2d}
+                };
+                json ev = BuildIntentEvent(bot, "intent_failed",
+                                           inFlightMoveIntentId_, inFlightMoveVerb_);
+                ev["result"] = result;
+                session->PushOutbound(ev.dump());
+
+                Sbywow::Bridge::BotSession::TerminalIntent rec;
+                rec.intentId   = inFlightMoveIntentId_;
+                rec.verb       = inFlightMoveVerb_;
+                rec.kind       = "intent_failed";
+                rec.resultJson = result.dump();
+                session->RecordTerminal(std::move(rec));
+            }
+            inFlightMove_ = false;
+            inFlightMoveIntentId_ = 0;
+            inFlightMoveVerb_.clear();
+        }
+        // else: still moving — fall through, do not return.
+    }
+
+    // ---- In-flight Cast polling --------------------------------------
+    //
+    // Detection signal: FindCurrentSpellBySpellId returns non-null
+    // while the spell is in m_currentSpells (CURRENT_GENERIC_SPELL or
+    // CURRENT_CHANNELED_SPELL). When it returns null, the cast either
+    // completed (cooldown will be set) or was interrupted (no
+    // cooldown). Correlate via HasSpellCooldown to disambiguate.
+    //
+    // Edge case: instant-cast spells with no cooldown can complete
+    // without setting either signal. Those terminate inline at
+    // dispatch via DispatchCastIntent and never reach this poller.
+
+    void SbywowAgentEngine::PollInFlightCast(Player* bot, std::shared_ptr<Sbywow::Bridge::BotSession> const& session)
+    {
+        if (!inFlightCast_)
+            return;
+        Spell* live = bot->FindCurrentSpellBySpellId(inFlightCastSpellId_);
+        auto elapsed = std::chrono::steady_clock::now() - inFlightCastDispatchAt_;
+        bool timedOut = elapsed > std::chrono::milliseconds(kCastTimeoutMs);
+
+        if (live && !timedOut)
+            return;  // still casting
+
+        bool succeeded = bot->HasSpellCooldown(inFlightCastSpellId_);
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(inFlightCastSpellId_);
+        std::string spellName = (si && si->SpellName[0]) ? si->SpellName[0] : std::string{};
+
+        if (session)
+        {
+            json result;
+            std::string kind;
+            if (succeeded)
+            {
+                result = {
+                    {"ok",         true},
+                    {"verb",       inFlightCastVerb_},
+                    {"spell_id",   inFlightCastSpellId_},
+                    {"spell_name", spellName},
+                    {"completed",  true}
+                };
+                kind = "intent_completed";
+            }
+            else
+            {
+                result = {
+                    {"ok",         false},
+                    {"verb",       inFlightCastVerb_},
+                    {"spell_id",   inFlightCastSpellId_},
+                    {"spell_name", spellName},
+                    {"error",      timedOut ? "cast timeout" :
+                                              "cast interrupted (movement / damage / cancel / out of range)"}
+                };
+                kind = "intent_failed";
+            }
+            json ev = BuildIntentEvent(bot, kind, inFlightCastIntentId_, inFlightCastVerb_);
+            ev["result"] = result;
+            session->PushOutbound(ev.dump());
+
+            Sbywow::Bridge::BotSession::TerminalIntent rec;
+            rec.intentId   = inFlightCastIntentId_;
+            rec.verb       = inFlightCastVerb_;
+            rec.kind       = kind;
+            rec.resultJson = result.dump();
+            session->RecordTerminal(std::move(rec));
+        }
+
+        inFlightCast_ = false;
+        inFlightCastIntentId_ = 0;
+        inFlightCastVerb_.clear();
+        inFlightCastSpellId_ = 0;
+    }
+
+    // ---- Per-kind dispatch helpers (used by DoNextAction) ------------
+
+    bool SbywowAgentEngine::DispatchMoveIntent(Player* bot,
+                                               std::shared_ptr<Sbywow::Bridge::BotSession> const& session,
+                                               std::shared_ptr<Sbywow::Bridge::PendingIntent> const& pending)
+    {
+        std::string outStr = ExecuteMove(bot, pending->intent);
+        json result;
+        try { result = json::parse(outStr); }
+        catch (std::exception const&) {
+            result = {{"ok", false}, {"error", "engine returned non-JSON"}};
+        }
+        bool ok = result.value("ok", false);
+        if (!ok)
+        {
+            json ev = BuildIntentEvent(bot, "intent_failed",
+                                       pending->intentId, pending->verb);
+            ev["result"] = result;
+            if (session)
+            {
+                session->PushOutbound(ev.dump());
                 Sbywow::Bridge::BotSession::TerminalIntent rec;
                 rec.intentId   = pending->intentId;
                 rec.verb       = pending->verb;
                 rec.kind       = "intent_failed";
                 rec.resultJson = result.dump();
                 session->RecordTerminal(std::move(rec));
-                return true;
             }
-            // MovePoint armed — hold the intent. Terminal event lands
-            // on a future tick from the in-flight poll.
-            inFlightMove_           = true;
-            inFlightMoveIntentId_   = pending->intentId;
-            inFlightMoveVerb_       = pending->verb;
-            inFlightMoveX_          = pending->intent.x;
-            inFlightMoveY_          = pending->intent.y;
-            inFlightMoveZ_          = pending->intent.z;
-            inFlightMoveDispatchAt_ = std::chrono::steady_clock::now();
+            return true;  // we did dispatch (and emitted terminal)
+        }
+        inFlightMove_           = true;
+        inFlightMoveIntentId_   = pending->intentId;
+        inFlightMoveVerb_       = pending->verb;
+        inFlightMoveX_          = pending->intent.x;
+        inFlightMoveY_          = pending->intent.y;
+        inFlightMoveZ_          = pending->intent.z;
+        inFlightMoveDispatchAt_ = std::chrono::steady_clock::now();
+        return true;
+    }
+
+    bool SbywowAgentEngine::DispatchCastIntent(Player* bot,
+                                               std::shared_ptr<Sbywow::Bridge::BotSession> const& session,
+                                               std::shared_ptr<Sbywow::Bridge::PendingIntent> const& pending)
+    {
+        // Each of these executors dispatches the cast and returns
+        // JSON. If the spell is now in m_currentSpells (cast-time or
+        // channeled), the result has `_inflight: true` AND a
+        // populated `spell_id` field — we set the in-flight slot and
+        // suppress the terminal emit. Otherwise the result is a
+        // normal terminal (instant-completed or pre-dispatch failed).
+        std::string outStr = ExecuteIntent(bot, pending->intent);
+        json result;
+        try { result = json::parse(outStr); }
+        catch (std::exception const&) {
+            result = {{"ok", false}, {"error", "engine returned non-JSON"}};
+        }
+        bool inflight = result.value("_inflight", false);
+        // _inflight is an internal marker between the executor and the
+        // dispatcher; strip it before the result hits SSE / the
+        // recovery ring so harness consumers don't see it.
+        result.erase("_inflight");
+
+        if (inflight)
+        {
+            inFlightCast_           = true;
+            inFlightCastIntentId_   = pending->intentId;
+            inFlightCastVerb_       = pending->verb;
+            inFlightCastSpellId_    = result.value("spell_id", 0u);
+            inFlightCastDispatchAt_ = std::chrono::steady_clock::now();
             return true;
         }
 
-        std::string outStr = ExecuteIntent(bot, pending->intent);
+        // Inline terminal (instant cast or pre-dispatch failure).
+        bool ok = result.value("ok", false);
+        std::string kind = ok ? "intent_completed" : "intent_failed";
+        json ev = BuildIntentEvent(bot, kind, pending->intentId, pending->verb);
+        ev["result"] = result;
+        if (session)
+        {
+            session->PushOutbound(ev.dump());
+            Sbywow::Bridge::BotSession::TerminalIntent rec;
+            rec.intentId   = pending->intentId;
+            rec.verb       = pending->verb;
+            rec.kind       = std::move(kind);
+            rec.resultJson = result.dump();
+            session->RecordTerminal(std::move(rec));
+        }
+        return false;
+    }
 
-        // Translate the verb's `ok` flag into intent_completed vs
-        // intent_failed. Embed the full result payload so SSE
-        // consumers get the same JSON we used to return synchronously
-        // on the HTTP response. Parse defensively — engine outputs
-        // valid JSON, but a malformed string shouldn't take down
-        // the bridge.
+    void SbywowAgentEngine::DispatchInstantIntent(Player* bot,
+                                                  std::shared_ptr<Sbywow::Bridge::BotSession> const& session,
+                                                  std::shared_ptr<Sbywow::Bridge::PendingIntent> const& pending)
+    {
+        std::string outStr = ExecuteIntent(bot, pending->intent);
         json result;
         try { result = json::parse(outStr); }
         catch (std::exception const&) { result = {{"ok", false}, {"error", "engine returned non-JSON"}}; }
         bool ok = result.value("ok", false);
-
         std::string kind = ok ? "intent_completed" : "intent_failed";
         json ev = BuildIntentEvent(bot, kind, pending->intentId, pending->verb);
         ev["result"] = result;
-        session->PushOutbound(ev.dump());
-
-        Sbywow::Bridge::BotSession::TerminalIntent rec;
-        rec.intentId   = pending->intentId;
-        rec.verb       = pending->verb;
-        rec.kind       = std::move(kind);
-        rec.resultJson = result.dump();
-        session->RecordTerminal(std::move(rec));
-
-        return true;
+        if (session)
+        {
+            session->PushOutbound(ev.dump());
+            Sbywow::Bridge::BotSession::TerminalIntent rec;
+            rec.intentId   = pending->intentId;
+            rec.verb       = pending->verb;
+            rec.kind       = std::move(kind);
+            rec.resultJson = result.dump();
+            session->RecordTerminal(std::move(rec));
+        }
     }
 
     std::string SbywowAgentEngine::ExecuteIntent(Player* bot, Intent const& intent)
@@ -1122,24 +1326,51 @@ namespace Sbywow
                 return json{{"ok", false}, {"error", "target not visible"}}.dump();
         }
         SpellCastResult res = bot->CastSpell(target, si, TRIGGERED_NONE);
+        if (res != SPELL_CAST_OK)
+        {
+            return json{
+                {"ok",          false},
+                {"verb",        "cast_spell"},
+                {"spell_id",    intent.spellId},
+                {"spell_name",  si->SpellName[0] ? si->SpellName[0] : ""},
+                {"target_guid", target->GetGUID().GetRawValue()},
+                {"target_name", target->GetName()},
+                {"cast_result", static_cast<int>(res)},
+                {"error",       "cast pre-check failed"}
+            }.dump();
+        }
+        // Cast accepted by CheckCast. If the spell is now in
+        // m_currentSpells, it's a cast-time or channeled spell —
+        // intent stays in-flight via inFlightCast_ slot. If not,
+        // it was instant (already finished); terminal fires inline.
+        bool inflight = bot->FindCurrentSpellBySpellId(intent.spellId) != nullptr;
         return json{
-            {"ok",          res == SPELL_CAST_OK},
+            {"ok",          true},
             {"verb",        "cast_spell"},
             {"spell_id",    intent.spellId},
             {"spell_name",  si->SpellName[0] ? si->SpellName[0] : ""},
             {"target_guid", target->GetGUID().GetRawValue()},
             {"target_name", target->GetName()},
-            {"cast_result", static_cast<int>(res)}
+            {"_inflight",   inflight}
         }.dump();
     }
 
     std::string SbywowAgentEngine::ExecuteUseItem(Player* bot, Intent const& intent)
     {
-        if (!intent.itemGuid)
-            return json{{"ok", false}, {"error", "use_item requires item_guid"}}.dump();
-        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        if (!intent.itemGuid && !intent.itemEntry)
+            return json{{"ok", false}, {"error", "use_item requires item_guid or item_entry"}}.dump();
+        Item* item = nullptr;
+        if (intent.itemGuid)
+            item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        else
+            item = bot->GetItemByEntry(intent.itemEntry);
         if (!item)
-            return json{{"ok", false}, {"error", "item not in bot's bag"}}.dump();
+            return json{
+                {"ok",         false},
+                {"error",      "item not in bot's inventory"},
+                {"item_guid",  intent.itemGuid},
+                {"item_entry", intent.itemEntry}
+            }.dump();
         ItemTemplate const* tpl = item->GetTemplate();
         if (!tpl)
             return json{{"ok", false}, {"error", "item has no template"}}.dump();
@@ -1175,14 +1406,40 @@ namespace Sbywow
         {
             targets.SetUnitTarget(bot);
         }
+        // Pre-check: if the spell can't even start (moving for a
+        // cast-time spell, on cooldown, etc.), CheckCast returns the
+        // refusal reason. We use Spell::CheckCast directly because
+        // CastItemUseSpell returns void.
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
+        if (si)
+        {
+            Spell preflight(bot, si, TRIGGERED_NONE, ObjectGuid::Empty, false);
+            preflight.m_targets   = targets;
+            preflight.m_CastItem  = item;
+            SpellCastResult pre = preflight.CheckCast(true);
+            if (pre != SPELL_CAST_OK)
+            {
+                return json{
+                    {"ok",          false},
+                    {"verb",        "use_item"},
+                    {"item_entry",  tpl->ItemId},
+                    {"item_name",   tpl->Name1},
+                    {"spell_id",    spellId},
+                    {"cast_result", static_cast<int>(pre)},
+                    {"error",       "cast pre-check failed (moving / on cooldown / not ready)"}
+                }.dump();
+            }
+        }
         bot->CastItemUseSpell(item, targets, /*cast_count*/ 0, /*glyphIndex*/ 0);
+        bool inflight = bot->FindCurrentSpellBySpellId(spellId) != nullptr;
         return json{
             {"ok",         true},
             {"verb",       "use_item"},
             {"item_guid",  intent.itemGuid},
             {"item_entry", tpl->ItemId},
             {"item_name",  tpl->Name1},
-            {"spell_id",   spellId}
+            {"spell_id",   spellId},
+            {"_inflight",  inflight}
         }.dump();
     }
 
@@ -1213,12 +1470,24 @@ namespace Sbywow
         if (!si)
             return json{{"ok", false}, {"error", "unknown spell_id"}, {"spell_id", spellId}}.dump();
         SpellCastResult res = bot->CastSpell(bot, si, TRIGGERED_NONE);
+        if (res != SPELL_CAST_OK)
+        {
+            return json{
+                {"ok",          false},
+                {"verb",        "mount"},
+                {"spell_id",    spellId},
+                {"spell_name",  si->SpellName[0] ? si->SpellName[0] : ""},
+                {"cast_result", static_cast<int>(res)},
+                {"error",       "cast pre-check failed"}
+            }.dump();
+        }
+        bool inflight = bot->FindCurrentSpellBySpellId(spellId) != nullptr;
         return json{
-            {"ok",          res == SPELL_CAST_OK},
-            {"verb",        "mount"},
-            {"spell_id",    spellId},
-            {"spell_name",  si->SpellName[0] ? si->SpellName[0] : ""},
-            {"cast_result", static_cast<int>(res)}
+            {"ok",         true},
+            {"verb",       "mount"},
+            {"spell_id",   spellId},
+            {"spell_name", si->SpellName[0] ? si->SpellName[0] : ""},
+            {"_inflight",  inflight}
         }.dump();
     }
 
@@ -1655,6 +1924,36 @@ namespace Sbywow
         isWaiting_ = false;
         waitingIntentId_ = 0;
         waitingIntentVerb_.clear();
+        return true;
+    }
+
+    bool SbywowAgentEngine::CancelInFlightCastIfMatch(uint64_t intentId)
+    {
+        // Find the live Spell* for our in-flight cast and call
+        // Spell::cancel(). Cancellation interrupts the cast and clears
+        // the m_currentSpells slot; the next PollInFlightCast tick
+        // will see the slot null + no cooldown → emit intent_failed.
+        // We DON'T emit intent_cancelled here — the cancel dispatcher
+        // (in BridgeServer) is the one source of truth for the
+        // intent_cancelled event, regardless of which path matched.
+        // We just clear our slot + return true so the dispatcher
+        // knows to emit cancelled instead of letting PollInFlightCast
+        // emit failed.
+        if (!inFlightCast_ || inFlightCastIntentId_ != intentId)
+            return false;
+
+        if (botAI)
+        {
+            if (Player* bot = botAI->GetBot())
+            {
+                if (Spell* live = bot->FindCurrentSpellBySpellId(inFlightCastSpellId_))
+                    live->cancel();
+            }
+        }
+        inFlightCast_ = false;
+        inFlightCastIntentId_ = 0;
+        inFlightCastVerb_.clear();
+        inFlightCastSpellId_ = 0;
         return true;
     }
 
