@@ -174,6 +174,23 @@ namespace Sbywow::Bridge
         bool   IsAgentMode() const { return agentMode_.load(); }
         void   SetAgentMode(bool v) { agentMode_.store(v); }
 
+        // Follow mode (idle behavior under agent_mode==true). Default
+        // true — when the agent has no queued intent and isn't in a
+        // wait suspension, SbywowAgentEngine delegates the tick to the
+        // default Engine, which runs the upstream follow / react /
+        // autonomic strategies. Bot follows master at idle.
+        //
+        // Agent disables via `set_follow off` for "anchor here
+        // indefinitely" scenarios that don't fit the wait timeout
+        // (camping a spot for many minutes, holding rendezvous, etc).
+        // Agent intents always preempt follow regardless — having
+        // an active intent in the queue or an active Move multi-tick
+        // is enough to suppress follow without toggling this flag.
+        // See decisions.md "Idle delegation + follow toggle"
+        // (2026-05-02) for rationale.
+        bool   IsFollowMode() const { return followMode_.load(); }
+        void   SetFollowMode(bool v) { followMode_.store(v); }
+
         // SSE attachment tracking — set when /events handler enters its
         // streaming loop, cleared when the connection drops. The
         // EventEmitter checks this before pushing (no point queuing if
@@ -204,6 +221,7 @@ namespace Sbywow::Bridge
 
         std::atomic<int64_t>                        lastAliveMs_{0};
         std::atomic<bool>                           agentMode_{false};
+        std::atomic<bool>                           followMode_{true};
         std::atomic<bool>                           sseAttached_{false};
 
         // Set in the constructor; read by UptimeMs() to compute

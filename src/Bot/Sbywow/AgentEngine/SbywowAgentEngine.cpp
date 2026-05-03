@@ -144,6 +144,112 @@ namespace Sbywow
             return defaultEngine_->DoNextAction(target, depth, minimal);
         }
 
+        // Combat hand-off. When the bot is in combat we delegate the
+        // tick to the default (upstream) non-combat engine. That
+        // engine carries the threat-detection + target-acquisition
+        // + ChangeEngine(BOT_STATE_COMBAT) logic in its strategy stack
+        // (AttackAction / AttackAnythingAction / etc.) — none of
+        // which live on us, since SbywowAgentEngine only carries the
+        // "default" packet-handler strategy by design.
+        //
+        // The preservation property still holds: agent's intent queue
+        // and wait state are PINNED on us, never touched by this
+        // delegation. When combat ends, DropTargetAction swaps the
+        // currentEngine back to non_combat (us), and we resume the
+        // agent's plan exactly where it left off.
+        if (bot->IsInCombat() && defaultEngine_)
+        {
+            ++defaultEngineTicksTotal_;
+            return defaultEngine_->DoNextAction(target, depth, minimal);
+        }
+
+        // Multi-tick Move: if a move was dispatched on a prior tick,
+        // poll arrival / path failure / timeout. While the move is
+        // active we return false outright — no queue drain, no idle
+        // delegation. This is the mechanism that prevents the
+        // default engine's FollowAction from running and replacing
+        // the bot's MotionMaster (which used to clobber agent moves
+        // and was the original motivation for the engine pivot).
+        if (inFlightMove_)
+        {
+            float dist2d = bot->GetExactDist2d(inFlightMoveX_, inFlightMoveY_);
+            bool  arrived = dist2d <= kMoveArrivalThreshold;
+            auto  elapsed = std::chrono::steady_clock::now() - inFlightMoveDispatchAt_;
+            bool  timedOut = elapsed > std::chrono::milliseconds(kMoveTimeoutMs);
+
+            // Check if MotionMaster's active generator is still our
+            // MovePoint. If something replaced it (FollowAction in a
+            // delegated path, charm, knockback, etc.) we treat the
+            // move as failed — the agent didn't get where it asked.
+            MotionMaster* mm = bot->GetMotionMaster();
+            bool generatorActive = mm &&
+                mm->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
+
+            if (arrived)
+            {
+                if (session)
+                {
+                    json result = {
+                        {"ok",       true},
+                        {"verb",     "move_to"},
+                        {"arrived",  true},
+                        {"position", {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
+                        {"distance", dist2d}
+                    };
+                    json ev = BuildIntentEvent(bot, "intent_completed",
+                                               inFlightMoveIntentId_, inFlightMoveVerb_);
+                    ev["result"] = result;
+                    session->PushOutbound(ev.dump());
+
+                    Sbywow::Bridge::BotSession::TerminalIntent rec;
+                    rec.intentId   = inFlightMoveIntentId_;
+                    rec.verb       = inFlightMoveVerb_;
+                    rec.kind       = "intent_completed";
+                    rec.resultJson = result.dump();
+                    session->RecordTerminal(std::move(rec));
+                }
+                inFlightMove_ = false;
+                inFlightMoveIntentId_ = 0;
+                inFlightMoveVerb_.clear();
+                // Fall through to wait/queue handling below.
+            }
+            else if (!generatorActive || timedOut)
+            {
+                if (session)
+                {
+                    json result = {
+                        {"ok",       false},
+                        {"verb",     "move_to"},
+                        {"error",    timedOut ? "move timeout" :
+                                                 "move generator replaced or path failed"},
+                        {"position", {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
+                        {"target",   {inFlightMoveX_, inFlightMoveY_, inFlightMoveZ_}},
+                        {"distance", dist2d}
+                    };
+                    json ev = BuildIntentEvent(bot, "intent_failed",
+                                               inFlightMoveIntentId_, inFlightMoveVerb_);
+                    ev["result"] = result;
+                    session->PushOutbound(ev.dump());
+
+                    Sbywow::Bridge::BotSession::TerminalIntent rec;
+                    rec.intentId   = inFlightMoveIntentId_;
+                    rec.verb       = inFlightMoveVerb_;
+                    rec.kind       = "intent_failed";
+                    rec.resultJson = result.dump();
+                    session->RecordTerminal(std::move(rec));
+                }
+                inFlightMove_ = false;
+                inFlightMoveIntentId_ = 0;
+                inFlightMoveVerb_.clear();
+                // Fall through.
+            }
+            else
+            {
+                // Still moving — preempts queue + idle delegation.
+                return false;
+            }
+        }
+
         // Wait suspension: while engaged, no intents drain. Wait is
         // explicit agent-issued sequencing — "do A, hold for N ms,
         // then do B" — implemented as a pause on intent dispatch.
@@ -190,9 +296,28 @@ namespace Sbywow
         std::shared_ptr<Sbywow::Bridge::PendingIntent> pending;
         if (!session->PopIntent(pending))
         {
-            // Idle tick — run reactive autonomic at low cadence.
-            // The agent doesn't have to think about food/drink;
-            // it's a reflex like combat reactions.
+            // Idle tick. Two paths:
+            //
+            // 1. follow_mode ON (default): delegate to the default
+            //    engine. Bot follows master at idle, runs the upstream
+            //    react / autonomic / eat-drink strategies. Agent
+            //    intents preempt this naturally — having an intent in
+            //    the queue (or an in-flight Move, or an active Wait)
+            //    means we never reach this branch.
+            //
+            // 2. follow_mode OFF: anchor in place. Agent has
+            //    explicitly opted out of follow ("camp here
+            //    indefinitely"). We still run our own reactive
+            //    eat/drink so a long anchor doesn't leave the bot
+            //    starving — autonomic is reflex, not "follow."
+            //
+            // See decisions.md "Idle delegation + follow toggle"
+            // (2026-05-02) for the design.
+            if (session->IsFollowMode() && defaultEngine_)
+            {
+                ++defaultEngineTicksTotal_;
+                return defaultEngine_->DoNextAction(target, depth, minimal);
+            }
             TickReactiveAutonomic(bot);
             return false;
         }
@@ -223,6 +348,55 @@ namespace Sbywow
                                  std::chrono::milliseconds(pending->intent.waitMs);
             waitingIntentId_   = pending->intentId;
             waitingIntentVerb_ = pending->verb;
+            return true;
+        }
+
+        // Move is also special-cased: dispatch the MovePoint into
+        // the MotionMaster (sub-tick), then HOLD the intent in our
+        // in-flight slot. The terminal event (intent_completed on
+        // arrival, intent_failed on path-replaced/timeout) fires from
+        // the multi-tick poll at the top of DoNextAction. While the
+        // move is in-flight, follow / queue-drain / idle delegation
+        // are all blocked — that's how the agent's move trajectory
+        // gets to complete without FollowAction yanking it back.
+        //
+        // Pre-dispatch validation (map mismatch, can't move,
+        // missing motion master) still fires intent_failed on the
+        // same tick like other sub-tick verbs, since no MovePoint
+        // was armed.
+        if (pending->intent.kind == IntentKind::Move)
+        {
+            std::string outStr = ExecuteMove(bot, pending->intent);
+            json result;
+            try { result = json::parse(outStr); }
+            catch (std::exception const&) {
+                result = {{"ok", false}, {"error", "engine returned non-JSON"}};
+            }
+            bool ok = result.value("ok", false);
+            if (!ok)
+            {
+                json ev = BuildIntentEvent(bot, "intent_failed",
+                                           pending->intentId, pending->verb);
+                ev["result"] = result;
+                session->PushOutbound(ev.dump());
+
+                Sbywow::Bridge::BotSession::TerminalIntent rec;
+                rec.intentId   = pending->intentId;
+                rec.verb       = pending->verb;
+                rec.kind       = "intent_failed";
+                rec.resultJson = result.dump();
+                session->RecordTerminal(std::move(rec));
+                return true;
+            }
+            // MovePoint armed — hold the intent. Terminal event lands
+            // on a future tick from the in-flight poll.
+            inFlightMove_           = true;
+            inFlightMoveIntentId_   = pending->intentId;
+            inFlightMoveVerb_       = pending->verb;
+            inFlightMoveX_          = pending->intent.x;
+            inFlightMoveY_          = pending->intent.y;
+            inFlightMoveZ_          = pending->intent.z;
+            inFlightMoveDispatchAt_ = std::chrono::steady_clock::now();
             return true;
         }
 
@@ -493,6 +667,29 @@ namespace Sbywow
         isWaiting_ = false;
         waitingIntentId_ = 0;
         waitingIntentVerb_.clear();
+        return true;
+    }
+
+    bool SbywowAgentEngine::CancelInFlightMoveIfMatch(uint64_t intentId)
+    {
+        // Same shape as CancelWaitIfMatch but for an in-flight Move.
+        // Clears the active MovePoint generator (so the bot stops
+        // moving) and lets the cancel dispatcher emit the
+        // intent_cancelled event.
+        if (!inFlightMove_ || inFlightMoveIntentId_ != intentId)
+            return false;
+
+        if (botAI)
+        {
+            if (Player* bot = botAI->GetBot())
+            {
+                if (MotionMaster* mm = bot->GetMotionMaster())
+                    mm->Clear();
+            }
+        }
+        inFlightMove_ = false;
+        inFlightMoveIntentId_ = 0;
+        inFlightMoveVerb_.clear();
         return true;
     }
 

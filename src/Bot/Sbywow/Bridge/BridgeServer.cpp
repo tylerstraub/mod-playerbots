@@ -732,10 +732,12 @@ namespace Sbywow::Bridge
 
         // ---- active_intents ----
         // Order: in-flight Wait suspension (head of execution) first,
-        // then queued in queue order. Wait is the only intent kind that
-        // persists across multiple ticks — sub-tick intents
-        // (move/interact/say/do_action) terminate inside the same tick
-        // they're popped, so they're never visible as "in_flight."
+        // then in-flight Move (multi-tick), then queued in queue order.
+        // Wait + Move are the two intent kinds that persist across
+        // ticks — Wait via suspension, Move via in-flight poll. The
+        // sub-tick verbs (interact / say / do_action) terminate
+        // inside the same tick they're popped, so they're never
+        // visible as in-flight.
         json activeIntents = json::array();
         Sbywow::SbywowAgentEngine* agentEng = nullptr;
         if (ai)
@@ -748,6 +750,21 @@ namespace Sbywow::Bridge
                 {"kind",              "wait"},
                 {"status",            "waiting"},
                 {"wait_remaining_ms", agentEng->WaitingRemainingMs()}
+            });
+        }
+        if (agentEng && agentEng->IsMoving())
+        {
+            float dist = bot->GetExactDist2d(agentEng->MovingTargetX(),
+                                              agentEng->MovingTargetY());
+            activeIntents.push_back({
+                {"intent_id",         std::to_string(agentEng->MovingIntentId())},
+                {"verb",              agentEng->MovingIntentVerb()},
+                {"kind",              "move"},
+                {"status",            "in_flight"},
+                {"target",            {agentEng->MovingTargetX(),
+                                        agentEng->MovingTargetY(),
+                                        agentEng->MovingTargetZ()}},
+                {"distance_remaining", dist}
             });
         }
         for (auto const& iv : sess.ProjectIntents())
@@ -772,6 +789,7 @@ namespace Sbywow::Bridge
         }
         json session = {
             {"agent_mode",               sess.IsAgentMode()},
+            {"follow_mode",              sess.IsFollowMode()},
             {"uptime_ms",                sess.UptimeMs()},
             {"heartbeat_ms",             sess.HeartbeatAgeMs()},
             {"sse_attached",             sess.IsSseAttached()},
@@ -1481,6 +1499,41 @@ namespace Sbywow::Bridge
                 }.dump();
             }
 
+            // set_follow toggles whether SbywowAgentEngine delegates
+            // idle ticks to the default engine (follow + react +
+            // autonomic) or anchors in place. Default is true (follow).
+            // Body: {"verb":"set_follow","mode":true|false}. Returns
+            // {ok, follow_mode, previous_mode, changed}. See
+            // decisions.md "Idle delegation + follow toggle"
+            // (2026-05-02) for the design.
+            if (verb == "set_follow")
+            {
+                if (!req.contains("mode") || !req["mode"].is_boolean())
+                    return json{{"ok", false},
+                                {"error", "set_follow requires boolean 'mode'"}}.dump();
+                bool desired = req["mode"].get<bool>();
+                bool prev = sess.IsFollowMode();
+                sess.SetFollowMode(desired);
+                if (prev != desired)
+                {
+                    json ev = {
+                        {"channel",      "lifecycle"},
+                        {"kind",         desired ? "follow_mode_entered" : "follow_mode_exited"},
+                        {"bot_guid",     bot->GetGUID().GetRawValue()},
+                        {"bot_name",     bot->GetName()},
+                        {"follow_mode",  desired}
+                    };
+                    sess.PushOutbound(ev.dump());
+                }
+                return json{
+                    {"ok",            true},
+                    {"verb",          "set_follow"},
+                    {"follow_mode",   desired},
+                    {"previous_mode", prev},
+                    {"changed",       prev != desired}
+                }.dump();
+            }
+
             // ---- Autonomous-driving primitives ------------------------
 
             if (verb == "move_to")
@@ -1535,7 +1588,12 @@ namespace Sbywow::Bridge
                     if (agentEng && agentEng->CancelWaitIfMatch(id))
                     {
                         cancelState   = "interrupted";
-                        cancelledVerb = "wait";  // only Wait can be in this state
+                        cancelledVerb = "wait";
+                    }
+                    else if (agentEng && agentEng->CancelInFlightMoveIfMatch(id))
+                    {
+                        cancelState   = "interrupted";
+                        cancelledVerb = "move_to";
                     }
                 }
 

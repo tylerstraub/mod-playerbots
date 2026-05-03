@@ -73,6 +73,13 @@ namespace Sbywow
         // wasn't waiting on this id.
         bool CancelWaitIfMatch(uint64_t intentId);
 
+        // Same shape as CancelWaitIfMatch, but for the in-flight Move
+        // intent. Move is now multi-tick: dispatch arms a MovePoint
+        // generator and HOLDS the intent across subsequent ticks
+        // until arrival or path failure. cancel_intent on an
+        // in-flight Move clears the generator and reports cancelled.
+        bool CancelInFlightMoveIfMatch(uint64_t intentId);
+
         // ---- Observability accessors -----------------------------
         //
         // Read-only views into engine state for inspect / snapshot.
@@ -86,6 +93,17 @@ namespace Sbywow
         // Returns 0 when not waiting; otherwise milliseconds until
         // the suspension expires (clamped at 0 if already past).
         int64_t     WaitingRemainingMs()  const;
+
+        // In-flight Move accessors. While inFlightMove_ is true the
+        // engine is holding a Move intent across ticks, polling for
+        // arrival / path failure. Surfaced in context.active_intents
+        // so the agent can see "I'm currently walking to X."
+        bool        IsMoving()             const { return inFlightMove_; }
+        uint64_t    MovingIntentId()       const { return inFlightMoveIntentId_; }
+        std::string const& MovingIntentVerb() const { return inFlightMoveVerb_; }
+        float       MovingTargetX()        const { return inFlightMoveX_; }
+        float       MovingTargetY()        const { return inFlightMoveY_; }
+        float       MovingTargetZ()        const { return inFlightMoveZ_; }
 
         uint64_t    TicksTotal()              const { return ticksTotal_; }
         uint64_t    IntentsDispatchedTotal()  const { return intentsDispatchedTotal_; }
@@ -134,6 +152,32 @@ namespace Sbywow
         // intent_completed when isWaiting_ lifts.
         uint64_t                               waitingIntentId_   = 0;
         std::string                            waitingIntentVerb_;
+
+        // Multi-tick Move state. Move is dispatched sub-tick into the
+        // MotionMaster, but the *intent* remains active across ticks
+        // until the bot arrives or the path fails. While a Move is
+        // in-flight, the engine returns false from DoNextAction (no
+        // queue drain, no idle delegation), so follow / react /
+        // anything-that-could-replace-the-active-MotionMaster does
+        // NOT run. This is the mechanism that prevents follow from
+        // clobbering agent-issued moves. See decisions.md "Idle
+        // delegation + multi-tick Move" (2026-05-02).
+        bool                                   inFlightMove_       = false;
+        uint64_t                               inFlightMoveIntentId_ = 0;
+        std::string                            inFlightMoveVerb_;
+        float                                  inFlightMoveX_      = 0.f;
+        float                                  inFlightMoveY_      = 0.f;
+        float                                  inFlightMoveZ_      = 0.f;
+        std::chrono::steady_clock::time_point  inFlightMoveDispatchAt_;
+        // Distance threshold (yards, 2D) at which we consider the
+        // bot "arrived." MovePoint terminates within ~1 yard in
+        // practice; 2.5y is permissive enough for path-snap edge
+        // cases without false positives mid-trip.
+        static constexpr float                 kMoveArrivalThreshold = 2.5f;
+        // Hard timeout for an in-flight Move. Path can refuse to
+        // generate (forceDestination=false) and never fire arrival;
+        // 60s is generous for any reasonable trip on a single map.
+        static constexpr int64_t               kMoveTimeoutMs = 60000;
 
         // Cumulative counters surfaced via inspect for "is the engine
         // ticking? are intents flowing?" sanity. World-thread only;
