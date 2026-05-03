@@ -1421,17 +1421,57 @@ namespace Sbywow::Bridge
                                     std::shared_ptr<PendingCommand>& cmd,
                                     json const& req)
         {
-            if (!req.contains("x") || !req.contains("y") || !req.contains("z") ||
-                !req["x"].is_number() || !req["y"].is_number() || !req["z"].is_number())
-                return json{{"ok", false}, {"error", "move_to requires numeric x, y, z"}}.dump();
+            // Three input modes:
+            //   1. explicit x/y/z (+ optional map)
+            //   2. target_guid → resolve to that object's current position
+            //      (creature, player, or gameobject — anything in the
+            //      bot's visibility). Saves the agent a find-nearby
+            //      round-trip just to extract coords.
+            //   3. (unset) → error
+            // Engine's Move executor stops within ~2.5y of the
+            // destination (kMoveArrivalThreshold) so target_guid mode
+            // naturally lands the bot in interact range without an
+            // explicit offset calculation.
+            bool hasXYZ = req.contains("x") && req.contains("y") && req.contains("z") &&
+                          req["x"].is_number() && req["y"].is_number() && req["z"].is_number();
+            bool hasTarget = req.contains("target_guid") && req["target_guid"].is_number();
 
             Sbywow::Intent i;
             i.kind = Sbywow::IntentKind::Move;
-            i.x = req["x"].get<float>();
-            i.y = req["y"].get<float>();
-            i.z = req["z"].get<float>();
-            if (req.contains("map") && !req["map"].is_null() && req["map"].is_number_unsigned())
-                i.map = req["map"].get<uint32_t>();
+
+            if (hasXYZ)
+            {
+                i.x = req["x"].get<float>();
+                i.y = req["y"].get<float>();
+                i.z = req["z"].get<float>();
+                if (req.contains("map") && !req["map"].is_null() && req["map"].is_number_unsigned())
+                    i.map = req["map"].get<uint32_t>();
+            }
+            else if (hasTarget)
+            {
+                ObjectGuid tg(req["target_guid"].get<uint64_t>());
+                WorldObject* target = nullptr;
+                if (Unit* u = ObjectAccessor::GetUnit(*bot, tg))
+                    target = u;
+                else if (tg.IsGameObject())
+                    target = bot->GetMap()->GetGameObject(tg);
+                if (!target)
+                    return json{
+                        {"ok",          false},
+                        {"reason",      "target_not_visible"},
+                        {"error",       "move_to target_guid not found in bot's visibility"},
+                        {"target_guid", req["target_guid"].get<uint64_t>()}
+                    }.dump();
+                i.x   = target->GetPositionX();
+                i.y   = target->GetPositionY();
+                i.z   = target->GetPositionZ();
+                i.map = target->GetMapId();
+            }
+            else
+            {
+                return json{{"ok", false}, {"error", "move_to requires either numeric x/y/z or target_guid"}}.dump();
+            }
+
             return Defer(bot, sess, cmd, "move_to", std::move(i));
         }
 
