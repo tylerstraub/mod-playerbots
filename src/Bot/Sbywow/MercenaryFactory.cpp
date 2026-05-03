@@ -20,8 +20,47 @@
 #include <unordered_map>
 #include <vector>
 
+namespace
+{
+    // Map race id → team id. Mirrors AC's Player::TeamForRace; copied
+    // here so we don't need to call into Player static helpers from a
+    // factory context. Must stay in sync with the race enum.
+    bool RaceIsAlliance(uint8 race)
+    {
+        switch (race)
+        {
+            case RACE_HUMAN:
+            case RACE_DWARF:
+            case RACE_NIGHTELF:
+            case RACE_GNOME:
+            case RACE_DRAENEI:
+                return true;
+            case RACE_ORC:
+            case RACE_UNDEAD_PLAYER:
+            case RACE_TAUREN:
+            case RACE_TROLL:
+            case RACE_BLOODELF:
+                return false;
+            default:
+                return true;  // unknown → assume alliance (won't trigger reroll)
+        }
+    }
+
+    bool RaceMatchesRequirement(uint8 race, FactionRequirement req)
+    {
+        switch (req)
+        {
+            case FactionRequirement::Any:      return true;
+            case FactionRequirement::Alliance: return RaceIsAlliance(race);
+            case FactionRequirement::Horde:    return !RaceIsAlliance(race);
+        }
+        return true;
+    }
+}
+
 ObjectGuid MercenaryFactory::CreateMerc(ObjectGuid ownerGuid, uint8 classId,
-                                        std::string const& desiredName)
+                                        std::string const& desiredName,
+                                        FactionRequirement factionReq)
 {
     using namespace std::chrono_literals;
 
@@ -73,14 +112,42 @@ ObjectGuid MercenaryFactory::CreateMerc(ObjectGuid ownerGuid, uint8 classId,
     // Reuse the existing factory's race/name/appearance roll. Empty nameCache
     // forces it to fall through to CreateRandomBotName (the playerbots_names
     // table query / conlang generator).
+    //
+    // Faction filter: upstream CreateRandomBot does its own 50/50 faction
+    // roll then picks a race within that faction. To force a specific
+    // faction we re-roll until the candidate matches. Each rejected
+    // candidate is destroyed in-memory (no DB write — that happens later
+    // at SaveToDB) and consumes a player-guid from the generator.
+    // 8 retries gives ~99.6% success rate against a 50/50 distribution.
     std::unordered_map<RandomPlayerbotFactory::NameRaceAndGender, std::vector<std::string>> emptyCache;
     RandomPlayerbotFactory factory;
-    Player* merc = factory.CreateRandomBot(session, classId, emptyCache);
+    constexpr int kMaxFactionRetries = 8;
+    Player* merc = nullptr;
+    int rolls = 0;
+    for (int attempt = 0; attempt < kMaxFactionRetries; ++attempt)
+    {
+        ++rolls;
+        Player* candidate = factory.CreateRandomBot(session, classId, emptyCache);
+        if (!candidate)
+            continue;
+        if (RaceMatchesRequirement(candidate->getRace(), factionReq))
+        {
+            merc = candidate;
+            break;
+        }
+        // Faction mismatch — clean up the in-memory Player. CleanupsBeforeDelete
+        // is safe on a freshly-created Player that's never entered the world
+        // or hit SaveToDB. Wastes the player-guid the generator handed out.
+        candidate->CleanupsBeforeDelete();
+        delete candidate;
+    }
 
     if (!merc)
     {
         LOG_ERROR("server.misc",
-            "Sbywow: CreateRandomBot failed for class {}", uint32(classId));
+            "Sbywow: CreateRandomBot failed for class {} after {} attempts "
+            "(faction_req={})",
+            uint32(classId), rolls, static_cast<int>(factionReq));
         delete session;
         return ObjectGuid();
     }

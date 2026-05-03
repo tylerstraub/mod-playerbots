@@ -125,6 +125,40 @@ public:
         return commandTable;
     }
 
+    // Parse a faction-filter token. Returns Any if unrecognized so the
+    // caller can keep the token as the class arg (backward-compat:
+    // .merc hire warrior still works).
+    static FactionRequirement ParseFactionArg(std::string const& arg, Player* master)
+    {
+        if      (arg == "alliance" || arg == "ally") return FactionRequirement::Alliance;
+        else if (arg == "horde")                     return FactionRequirement::Horde;
+        else if (arg == "same")
+        {
+            if (master && master->GetTeamId() == TEAM_ALLIANCE)
+                return FactionRequirement::Alliance;
+            else
+                return FactionRequirement::Horde;
+        }
+        else if (arg == "opposite" || arg == "opp")
+        {
+            if (master && master->GetTeamId() == TEAM_ALLIANCE)
+                return FactionRequirement::Horde;
+            else
+                return FactionRequirement::Alliance;
+        }
+        else if (arg == "any")                       return FactionRequirement::Any;
+        return FactionRequirement::Any;  // unrecognized: caller keeps as class
+    }
+
+    static bool IsFactionArg(std::string const& arg)
+    {
+        return arg == "alliance" || arg == "ally" ||
+               arg == "horde"    ||
+               arg == "same"     ||
+               arg == "opposite" || arg == "opp" ||
+               arg == "any";
+    }
+
     static bool HandleHireCommand(ChatHandler* handler, char const* args)
     {
         Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
@@ -134,7 +168,9 @@ public:
         std::string arg = args ? args : "";
         if (arg.empty())
         {
-            handler->SendSysMessage("Usage: .merc hire <class> [name]   (class: warrior|paladin|hunter|rogue|priest|dk|shaman|mage|warlock|druid)");
+            handler->SendSysMessage("Usage: .merc hire [faction] <class> [name]");
+            handler->SendSysMessage("  faction (optional): same | opposite | alliance | horde | any  (default: any)");
+            handler->SendSysMessage("  class:              warrior|paladin|hunter|rogue|priest|dk|shaman|mage|warlock|druid");
             return true;
         }
 
@@ -146,20 +182,50 @@ public:
             return true;
         }
 
-        // Split into class [name].
-        std::string classArg, desiredName;
-        std::size_t space = arg.find(' ');
-        if (space == std::string::npos)
+        // Split into tokens. Optional faction first, then class, then
+        // optional name. Faction is detected by IsFactionArg; if the
+        // first token isn't a faction keyword, it's treated as the class
+        // (backward-compat: .merc hire warrior still works).
+        std::vector<std::string> tokens;
+        std::size_t pos = 0;
+        while (pos < arg.size())
         {
-            classArg = arg;
+            std::size_t next = arg.find(' ', pos);
+            if (next == std::string::npos)
+            {
+                tokens.push_back(arg.substr(pos));
+                break;
+            }
+            if (next > pos)
+                tokens.push_back(arg.substr(pos, next - pos));
+            pos = next + 1;
         }
-        else
+
+        FactionRequirement factionReq = FactionRequirement::Any;
+        std::size_t classIdx = 0;
+        if (!tokens.empty() && IsFactionArg(tokens[0]))
         {
-            classArg    = arg.substr(0, space);
-            desiredName = arg.substr(space + 1);
-            // Strip trailing whitespace from name.
-            while (!desiredName.empty() && desiredName.back() == ' ')
-                desiredName.pop_back();
+            factionReq = ParseFactionArg(tokens[0], player);
+            classIdx = 1;
+        }
+
+        if (classIdx >= tokens.size())
+        {
+            handler->SendSysMessage("Missing class. Usage: .merc hire [faction] <class> [name]");
+            return true;
+        }
+
+        std::string classArg = tokens[classIdx];
+        std::string desiredName;
+        if (classIdx + 1 < tokens.size())
+        {
+            // Reassemble remaining tokens as the name (in case the user
+            // passed a multi-word name).
+            for (std::size_t i = classIdx + 1; i < tokens.size(); ++i)
+            {
+                if (!desiredName.empty()) desiredName += ' ';
+                desiredName += tokens[i];
+            }
         }
 
         uint8 cls = ParseClassArg(classArg);
@@ -169,7 +235,7 @@ public:
             return true;
         }
 
-        ObjectGuid mercGuid = MercenaryFactory::CreateMerc(player->GetGUID(), cls, desiredName);
+        ObjectGuid mercGuid = MercenaryFactory::CreateMerc(player->GetGUID(), cls, desiredName, factionReq);
         if (mercGuid.IsEmpty())
         {
             if (!desiredName.empty())
