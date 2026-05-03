@@ -564,11 +564,35 @@ namespace Sbywow::Bridge
         }
 
         // Gossip menu snapshot. Returns null when no menu is open.
-        // Wired in Batch 4 — reads bot->PlayerTalkClass->GetGossipMenu()
-        // for the option list (index, text, type).
-        json BuildGossipBlock(Player* /*bot*/)
+        // Reads bot->PlayerTalkClass->GetGossipMenu() for the option list.
+        // Note: PlayerTalkClass is constructed at Player init and survives
+        // until destruction, so the pointer is always valid on a live bot;
+        // emptiness is detected by GossipMenu::Empty().
+        json BuildGossipBlock(Player* bot)
         {
-            return nullptr;
+            if (!bot || !bot->PlayerTalkClass)
+                return nullptr;
+            GossipMenu& menu = bot->PlayerTalkClass->GetGossipMenu();
+            if (menu.Empty())
+                return nullptr;
+            json options = json::array();
+            for (auto const& [idx, item] : menu.GetMenuItems())
+            {
+                options.push_back({
+                    {"index",       idx},
+                    {"icon",        static_cast<int>(item.MenuItemIcon)},
+                    {"option_type", item.OptionType},
+                    {"text",        item.Message},
+                    {"is_coded",    item.IsCoded},
+                    {"box_money",   item.BoxMoney}
+                });
+            }
+            ObjectGuid sender = menu.GetSenderGUID();
+            return json{
+                {"menu_id",     menu.GetMenuId()},
+                {"sender_guid", sender.GetRawValue()},
+                {"options",     options}
+            };
         }
 
         // Count used vs. total non-equipped, non-keyring slots:

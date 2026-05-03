@@ -6,18 +6,27 @@
 
 #include "AiFactory.h"
 #include "Bag.h"
+#include "Corpse.h"
 #include "Creature.h"
 #include "CreatureData.h"
 #include "Event.h"
+#include "GameObject.h"
 #include "GossipDef.h"
+#include "Group.h"
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "ItemPackets.h"
 #include "Log.h"
+#include "LootMgr.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
+#include "Opcodes.h"
 #include "Player.h"
+#include "QuestDef.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include "TradeData.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
@@ -636,6 +645,30 @@ namespace Sbywow
             }
             out["gossip_options"] = gossipOpts;
             out["gossip_menu_open_id"] = menu.GetMenuId();
+
+            // gossip.menu_opened SSE event so a harness watching the
+            // event stream learns that a navigable menu is up — without
+            // having to correlate from the interact_with response.
+            // Pure vendors that skip the menu (server sends list directly)
+            // don't fire this event; the menu stays empty for them.
+            if (!menu.Empty())
+            {
+                if (auto session = Sbywow::Bridge::BridgeServer::Instance().GetSession(bot->GetGUID()))
+                {
+                    json ev = {
+                        {"channel",     "gossip"},
+                        {"kind",        "menu_opened"},
+                        {"bot_guid",    bot->GetGUID().GetRawValue()},
+                        {"bot_name",    bot->GetName()},
+                        {"npc_guid",    intent.guid},
+                        {"npc_name",    npc->GetName()},
+                        {"menu_id",     menu.GetMenuId()},
+                        {"sender_guid", menu.GetSenderGUID().GetRawValue()},
+                        {"options",     gossipOpts}
+                    };
+                    session->PushOutbound(ev.dump());
+                }
+            }
         }
 
         return out.dump();
@@ -814,33 +847,802 @@ namespace Sbywow
 
     // ---- Phase 4 / 5 — stubs (impls land in their respective batches) -
 
-    std::string SbywowAgentEngine::ExecuteSelectGossipOption (Player*, Intent const&) { return NotImplemented("select_gossip_option"); }
-    std::string SbywowAgentEngine::ExecuteTradeInitiate      (Player*, Intent const&) { return NotImplemented("trade_initiate"); }
-    std::string SbywowAgentEngine::ExecuteTradeOfferItem     (Player*, Intent const&) { return NotImplemented("trade_offer_item"); }
-    std::string SbywowAgentEngine::ExecuteTradeOfferMoney    (Player*, Intent const&) { return NotImplemented("trade_offer_money"); }
-    std::string SbywowAgentEngine::ExecuteTradeAccept        (Player*, Intent const&) { return NotImplemented("trade_accept"); }
-    std::string SbywowAgentEngine::ExecuteTradeCancel        (Player*, Intent const&) { return NotImplemented("trade_cancel"); }
-    std::string SbywowAgentEngine::ExecuteEquipItem          (Player*, Intent const&) { return NotImplemented("equip_item"); }
-    std::string SbywowAgentEngine::ExecuteUnequipItem        (Player*, Intent const&) { return NotImplemented("unequip_item"); }
-    std::string SbywowAgentEngine::ExecuteDestroyItem        (Player*, Intent const&) { return NotImplemented("destroy_item"); }
-    std::string SbywowAgentEngine::ExecuteUseItem            (Player*, Intent const&) { return NotImplemented("use_item"); }
-    std::string SbywowAgentEngine::ExecuteCastSpell          (Player*, Intent const&) { return NotImplemented("cast_spell"); }
-    std::string SbywowAgentEngine::ExecuteMount              (Player*, Intent const&) { return NotImplemented("mount"); }
-    std::string SbywowAgentEngine::ExecuteDismount           (Player*, Intent const&) { return NotImplemented("dismount"); }
-    std::string SbywowAgentEngine::ExecuteInteractGameObject (Player*, Intent const&) { return NotImplemented("interact_gameobject"); }
-    std::string SbywowAgentEngine::ExecuteLootTarget         (Player*, Intent const&) { return NotImplemented("loot_target"); }
-    std::string SbywowAgentEngine::ExecuteMailSend           (Player*, Intent const&) { return NotImplemented("mail_send"); }
-    std::string SbywowAgentEngine::ExecuteMailTakeItem       (Player*, Intent const&) { return NotImplemented("mail_take_item"); }
-    std::string SbywowAgentEngine::ExecuteMailTakeMoney      (Player*, Intent const&) { return NotImplemented("mail_take_money"); }
-    std::string SbywowAgentEngine::ExecuteQuestAccept        (Player*, Intent const&) { return NotImplemented("quest_accept"); }
-    std::string SbywowAgentEngine::ExecuteQuestComplete      (Player*, Intent const&) { return NotImplemented("quest_complete"); }
-    std::string SbywowAgentEngine::ExecuteQuestAbandon       (Player*, Intent const&) { return NotImplemented("quest_abandon"); }
-    std::string SbywowAgentEngine::ExecuteQuestShare         (Player*, Intent const&) { return NotImplemented("quest_share"); }
-    std::string SbywowAgentEngine::ExecuteGroupAcceptInvite  (Player*, Intent const&) { return NotImplemented("group_accept_invite"); }
-    std::string SbywowAgentEngine::ExecuteGroupDeclineInvite (Player*, Intent const&) { return NotImplemented("group_decline_invite"); }
-    std::string SbywowAgentEngine::ExecuteGroupLeave         (Player*, Intent const&) { return NotImplemented("group_leave"); }
-    std::string SbywowAgentEngine::ExecuteGroupPromoteLeader (Player*, Intent const&) { return NotImplemented("group_promote_leader"); }
-    std::string SbywowAgentEngine::ExecuteGroupReadyCheckRespond(Player*, Intent const&) { return NotImplemented("group_ready_check_respond"); }
+    std::string SbywowAgentEngine::ExecuteSelectGossipOption(Player* bot, Intent const& intent)
+    {
+        if (!bot->PlayerTalkClass)
+            return json{{"ok", false}, {"error", "no PlayerTalkClass on bot"}}.dump();
+        GossipMenu& menu = bot->PlayerTalkClass->GetGossipMenu();
+        if (menu.Empty())
+            return json{{"ok", false}, {"error", "no gossip menu currently open"}}.dump();
+
+        uint32 optionIdx = static_cast<uint32>(intent.intParam < 0 ? 0 : intent.intParam);
+        if (!menu.GetItem(optionIdx))
+            return json{
+                {"ok",    false},
+                {"error", "option_index not present in current menu"},
+                {"option_index", optionIdx},
+                {"available_count", menu.GetMenuItemCount()}
+            }.dump();
+
+        // Construct + dispatch the same opcode the client would send.
+        // HandleGossipSelectOptionOpcode reads `guid >> menuId >>
+        // gossipListId` (and an optional code string for IsCoded
+        // options); we don't support coded options yet (rare, mostly
+        // GM/admin menus).
+        ObjectGuid sender = menu.GetSenderGUID();
+        uint32     menuId = menu.GetMenuId();
+        WorldPacket data(CMSG_GOSSIP_SELECT_OPTION, 8 + 4 + 4);
+        data << sender;
+        data << menuId;
+        data << optionIdx;
+        bot->GetSession()->HandleGossipSelectOptionOpcode(data);
+
+        return json{
+            {"ok",           true},
+            {"verb",         "select_gossip_option"},
+            {"option_index", optionIdx},
+            {"menu_id",      menuId},
+            {"sender_guid",  sender.GetRawValue()}
+        }.dump();
+    }
+    std::string SbywowAgentEngine::ExecuteTradeInitiate(Player* bot, Intent const& intent)
+    {
+        if (!intent.guid)
+            return json{{"ok", false}, {"error", "trade_initiate requires partner_guid"}}.dump();
+        ObjectGuid partner(intent.guid);
+        WorldPacket data(CMSG_INITIATE_TRADE, 8);
+        data << partner;
+        bot->GetSession()->HandleInitiateTradeOpcode(data);
+        return json{
+            {"ok",           true},
+            {"verb",         "trade_initiate"},
+            {"partner_guid", intent.guid}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteTradeOfferItem(Player* bot, Intent const& intent)
+    {
+        if (!intent.itemGuid)
+            return json{{"ok", false}, {"error", "trade_offer_item requires item_guid"}}.dump();
+        if (intent.intParam < 0 || intent.intParam >= TRADE_SLOT_COUNT)
+            return json{
+                {"ok", false},
+                {"error", "trade_slot out of range (0-6, where 6 is non-traded)"},
+                {"trade_slot", intent.intParam}
+            }.dump();
+        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        if (!item)
+            return json{{"ok", false}, {"error", "item_guid not in bot's bag"}}.dump();
+
+        // Handler reads uint8 tradeSlot, uint8 bag, uint8 slot.
+        WorldPacket data(CMSG_SET_TRADE_ITEM, 3);
+        data << uint8(intent.intParam);
+        data << uint8(item->GetBagSlot());
+        data << uint8(item->GetSlot());
+        bot->GetSession()->HandleSetTradeItemOpcode(data);
+
+        return json{
+            {"ok",         true},
+            {"verb",       "trade_offer_item"},
+            {"trade_slot", intent.intParam},
+            {"item_guid",  intent.itemGuid},
+            {"item_entry", item->GetTemplate() ? item->GetTemplate()->ItemId : 0}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteTradeOfferMoney(Player* bot, Intent const& intent)
+    {
+        WorldPacket data(CMSG_SET_TRADE_GOLD, 4);
+        data << uint32(intent.copper);
+        bot->GetSession()->HandleSetTradeGoldOpcode(data);
+        return json{
+            {"ok",     true},
+            {"verb",   "trade_offer_money"},
+            {"copper", intent.copper}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteTradeAccept(Player* bot, Intent const& /*intent*/)
+    {
+        WorldPacket data(CMSG_ACCEPT_TRADE, 0);
+        bot->GetSession()->HandleAcceptTradeOpcode(data);
+        return json{{"ok", true}, {"verb", "trade_accept"}}.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteTradeCancel(Player* bot, Intent const& /*intent*/)
+    {
+        WorldPacket data(CMSG_CANCEL_TRADE, 0);
+        bot->GetSession()->HandleCancelTradeOpcode(data);
+        return json{{"ok", true}, {"verb", "trade_cancel"}}.dump();
+    }
+    std::string SbywowAgentEngine::ExecuteEquipItem(Player* bot, Intent const& intent)
+    {
+        if (!intent.itemGuid)
+            return json{{"ok", false}, {"error", "equip_item requires item_guid"}}.dump();
+        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        if (!item)
+            return json{{"ok", false}, {"error", "item not in bot's bag"}}.dump();
+
+        // intent.intParam: -1 = auto-find slot (the only mode v1
+        // supports). Explicit equipment-slot targeting (HandleAutoEquip
+        // ItemSlotOpcode) is a follow-up — use the auto path which
+        // already picks correctly for the item's class/subclass.
+        WorldPacket raw(CMSG_AUTOEQUIP_ITEM, 2);
+        WorldPackets::Item::AutoEquipItem packet(std::move(raw));
+        packet.SourceBag  = item->GetBagSlot();
+        packet.SourceSlot = item->GetSlot();
+        bot->GetSession()->HandleAutoEquipItemOpcode(packet);
+
+        // Verify by re-reading the item's slot — if it's now in
+        // INVENTORY_SLOT_BAG_0 with slot < EQUIPMENT_SLOT_END the equip
+        // succeeded. The handler emits SendEquipError on failure but
+        // doesn't return a status here.
+        Item* after = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        bool equipped = false;
+        uint8 finalSlot = 0;
+        if (after)
+        {
+            finalSlot = after->GetSlot();
+            equipped = (after->GetBagSlot() == INVENTORY_SLOT_BAG_0) &&
+                       (finalSlot < EQUIPMENT_SLOT_END);
+        }
+        return json{
+            {"ok",        equipped},
+            {"verb",      "equip_item"},
+            {"item_guid", intent.itemGuid},
+            {"final_slot", finalSlot},
+            {"final_bag",  after ? after->GetBagSlot() : 0}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteUnequipItem(Player* bot, Intent const& intent)
+    {
+        if (intent.intParam < 0 || intent.intParam >= EQUIPMENT_SLOT_END)
+            return json{
+                {"ok", false},
+                {"error", "equip_slot out of range (0-18)"},
+                {"slot", intent.intParam}
+            }.dump();
+        uint8 srcSlot = static_cast<uint8>(intent.intParam);
+        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, srcSlot);
+        if (!item)
+            return json{
+                {"ok",    false},
+                {"error", "no item equipped in that slot"},
+                {"slot",  srcSlot}
+            }.dump();
+
+        // Find the first free backpack/bag slot to land the item in.
+        // Walk backpack first (slots 23..38), then each bag's slots.
+        uint8 destBag = INVENTORY_SLOT_BAG_0;
+        uint8 destSlot = NULL_SLOT;
+        for (uint8 s = INVENTORY_SLOT_ITEM_START; s < INVENTORY_SLOT_ITEM_END; ++s)
+        {
+            if (!bot->GetItemByPos(INVENTORY_SLOT_BAG_0, s))
+            {
+                destSlot = s;
+                break;
+            }
+        }
+        if (destSlot == NULL_SLOT)
+        {
+            for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && destSlot == NULL_SLOT; ++b)
+            {
+                Bag* bag = bot->GetBagByPos(b);
+                if (!bag) continue;
+                for (uint8 s = 0; s < bag->GetBagSize(); ++s)
+                {
+                    if (!bot->GetItemByPos(b, s))
+                    {
+                        destBag = b;
+                        destSlot = s;
+                        break;
+                    }
+                }
+            }
+        }
+        if (destSlot == NULL_SLOT)
+            return json{{"ok", false}, {"error", "no free bag slot to receive item"}}.dump();
+
+        WorldPacket raw(CMSG_SWAP_ITEM, 4);
+        WorldPackets::Item::SwapItem packet(std::move(raw));
+        packet.DestinationBag  = destBag;
+        packet.DestinationSlot = destSlot;
+        packet.SourceBag       = INVENTORY_SLOT_BAG_0;
+        packet.SourceSlot      = srcSlot;
+        bot->GetSession()->HandleSwapItem(packet);
+
+        Item* after = bot->GetItemByPos(destBag, destSlot);
+        bool moved = (after != nullptr) && (after->GetGUID() == item->GetGUID());
+        return json{
+            {"ok",       moved},
+            {"verb",     "unequip_item"},
+            {"src_slot", srcSlot},
+            {"dest_bag", destBag},
+            {"dest_slot", destSlot}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteDestroyItem(Player* bot, Intent const& intent)
+    {
+        if (!intent.itemGuid)
+            return json{{"ok", false}, {"error", "destroy_item requires item_guid"}}.dump();
+        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        if (!item)
+            return json{{"ok", false}, {"error", "item not in bot's bag"}}.dump();
+
+        ItemTemplate const* tpl = item->GetTemplate();
+        std::string itemName = tpl ? tpl->Name1 : std::string{};
+        uint32 itemEntry = tpl ? tpl->ItemId : 0;
+        uint32 startCount = item->GetCount();
+
+        if (intent.quantity == 0 || intent.quantity >= startCount)
+        {
+            // Destroy whole stack.
+            bot->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
+            return json{
+                {"ok",         true},
+                {"verb",       "destroy_item"},
+                {"item_guid",  intent.itemGuid},
+                {"item_entry", itemEntry},
+                {"item_name",  itemName},
+                {"destroyed",  startCount}
+            }.dump();
+        }
+
+        // Partial destroy via DestroyItemCount(item*, count, update).
+        uint32 toDestroy = intent.quantity;
+        bot->DestroyItemCount(item, toDestroy, true);
+        return json{
+            {"ok",         true},
+            {"verb",       "destroy_item"},
+            {"item_guid",  intent.itemGuid},
+            {"item_entry", itemEntry},
+            {"item_name",  itemName},
+            {"destroyed",  intent.quantity - toDestroy}  // toDestroy is residual
+        }.dump();
+    }
+    std::string SbywowAgentEngine::ExecuteCastSpell(Player* bot, Intent const& intent)
+    {
+        if (!intent.spellId)
+            return json{{"ok", false}, {"error", "cast_spell requires spell_id"}}.dump();
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(intent.spellId);
+        if (!si)
+            return json{
+                {"ok",       false},
+                {"error",    "unknown spell_id"},
+                {"spell_id", intent.spellId}
+            }.dump();
+        Unit* target = bot;
+        if (intent.guid)
+        {
+            if (Unit* t = ObjectAccessor::GetUnit(*bot, ObjectGuid(intent.guid)))
+                target = t;
+            else
+                return json{{"ok", false}, {"error", "target not visible"}}.dump();
+        }
+        SpellCastResult res = bot->CastSpell(target, si, TRIGGERED_NONE);
+        return json{
+            {"ok",          res == SPELL_CAST_OK},
+            {"verb",        "cast_spell"},
+            {"spell_id",    intent.spellId},
+            {"spell_name",  si->SpellName[0] ? si->SpellName[0] : ""},
+            {"target_guid", target->GetGUID().GetRawValue()},
+            {"target_name", target->GetName()},
+            {"cast_result", static_cast<int>(res)}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteUseItem(Player* bot, Intent const& intent)
+    {
+        if (!intent.itemGuid)
+            return json{{"ok", false}, {"error", "use_item requires item_guid"}}.dump();
+        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        if (!item)
+            return json{{"ok", false}, {"error", "item not in bot's bag"}}.dump();
+        ItemTemplate const* tpl = item->GetTemplate();
+        if (!tpl)
+            return json{{"ok", false}, {"error", "item has no template"}}.dump();
+
+        // Pick the first non-null on-use spell from the item's spells.
+        // Most usable items put their spell in slot 0 with trigger
+        // ITEM_SPELLTRIGGER_ON_USE; some scrolls/equipment use slot 1.
+        uint32 spellId = 0;
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        {
+            if (tpl->Spells[i].SpellId != 0 &&
+                tpl->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE)
+            {
+                spellId = tpl->Spells[i].SpellId;
+                break;
+            }
+        }
+        if (!spellId)
+            return json{
+                {"ok",         false},
+                {"error",      "item has no on-use spell"},
+                {"item_entry", tpl->ItemId},
+                {"item_name",  tpl->Name1}
+            }.dump();
+
+        SpellCastTargets targets;
+        if (intent.guid)
+        {
+            if (Unit* t = ObjectAccessor::GetUnit(*bot, ObjectGuid(intent.guid)))
+                targets.SetUnitTarget(t);
+        }
+        else
+        {
+            targets.SetUnitTarget(bot);
+        }
+        bot->CastItemUseSpell(item, targets, /*cast_count*/ 0, /*glyphIndex*/ 0);
+        return json{
+            {"ok",         true},
+            {"verb",       "use_item"},
+            {"item_guid",  intent.itemGuid},
+            {"item_entry", tpl->ItemId},
+            {"item_name",  tpl->Name1},
+            {"spell_id",   spellId}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteMount(Player* bot, Intent const& intent)
+    {
+        // Pick a mount spell. If the agent supplied one, use it; else
+        // walk the bot's spellbook for a mount-aura spell. AC marks
+        // mount spells via Effect[0].ApplyAuraName == SPELL_AURA_MOUNTED.
+        uint32 spellId = intent.spellId;
+        if (!spellId)
+        {
+            for (auto const& [sid, _] : bot->GetSpellMap())
+            {
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(sid);
+                if (!si) continue;
+                if (si->Effects[0].ApplyAuraName == SPELL_AURA_MOUNTED &&
+                    si->IsAbilityLearnedWithProfession() == false)
+                {
+                    spellId = sid;
+                    break;
+                }
+            }
+        }
+        if (!spellId)
+            return json{{"ok", false}, {"error", "no mount spell found in spellbook"}}.dump();
+
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
+        if (!si)
+            return json{{"ok", false}, {"error", "unknown spell_id"}, {"spell_id", spellId}}.dump();
+        SpellCastResult res = bot->CastSpell(bot, si, TRIGGERED_NONE);
+        return json{
+            {"ok",          res == SPELL_CAST_OK},
+            {"verb",        "mount"},
+            {"spell_id",    spellId},
+            {"spell_name",  si->SpellName[0] ? si->SpellName[0] : ""},
+            {"cast_result", static_cast<int>(res)}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteDismount(Player* bot, Intent const& /*intent*/)
+    {
+        if (!bot->IsMounted())
+            return json{{"ok", false}, {"error", "bot is not mounted"}}.dump();
+        bot->Dismount();
+        bot->RemoveAurasByType(SPELL_AURA_MOUNTED);
+        return json{{"ok", true}, {"verb", "dismount"}}.dump();
+    }
+    std::string SbywowAgentEngine::ExecuteInteractGameObject(Player* bot, Intent const& intent)
+    {
+        ObjectGuid og(intent.guid);
+        if (!og.IsGameObject())
+            return json{{"ok", false}, {"error", "interact_gameobject requires a gameobject guid"}}.dump();
+        GameObject* go = bot->GetMap()->GetGameObject(og);
+        if (!go)
+            return json{{"ok", false}, {"error", "gameobject not found on bot's map"}}.dump();
+
+        // INTERACTION_DISTANCE check mirrors the client; some GOs allow
+        // longer (fishing nodes), but the canonical check is on the
+        // handler — let it enforce.
+        WorldPacket data(CMSG_GAMEOBJ_USE, 8);
+        data << og;
+        bot->GetSession()->HandleGameObjectUseOpcode(data);
+
+        return json{
+            {"ok",       true},
+            {"verb",     "interact_gameobject"},
+            {"guid",     intent.guid},
+            {"entry",    go->GetEntry()},
+            {"name",     go->GetName()},
+            {"go_type",  static_cast<int>(go->GetGoType())},
+            {"distance", bot->GetExactDist(go)}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteLootTarget(Player* bot, Intent const& intent)
+    {
+        ObjectGuid lguid(intent.guid);
+        // Open loot — drives Player::SendLoot which sets m_lootGuid +
+        // sends SMSG_LOOT_RESPONSE to the client. That's also where the
+        // server resolves which Loot* applies for this target.
+        bot->SendLoot(lguid, LOOT_CORPSE);
+
+        // Resolve the underlying Loot* by guid type. Mirrors the dispatch
+        // in HandleAutostoreLootItemOpcode.
+        Loot* loot = nullptr;
+        if (lguid.IsAnyTypeCreature())
+        {
+            if (Creature* c = bot->GetMap()->GetCreature(lguid))
+                loot = &c->loot;
+        }
+        else if (lguid.IsGameObject())
+        {
+            if (GameObject* go = bot->GetMap()->GetGameObject(lguid))
+                loot = &go->loot;
+        }
+        else if (lguid.IsCorpse())
+        {
+            if (Corpse* c = ObjectAccessor::GetCorpse(*bot, lguid))
+                loot = &c->loot;
+        }
+
+        if (!loot)
+        {
+            bot->SendLootRelease(lguid);
+            return json{
+                {"ok",    false},
+                {"error", "no loot for this target (already looted, not lootable, or wrong guid type)"},
+                {"guid",  intent.guid}
+            }.dump();
+        }
+
+        // Auto-take every unsorted item slot. Items requiring a group
+        // roll (group_loot / need_before_greed / master_loot) will fail
+        // StoreLootItem and stay in the loot — that's correct behavior;
+        // the agent can roll separately via group_ready_check_respond
+        // (Phase 5) once that wiring lands.
+        uint32 itemsTaken = 0;
+        json takenList = json::array();
+        for (uint8 i = 0; i < loot->items.size(); ++i)
+        {
+            LootItem const& li = loot->items[i];
+            if (li.is_looted)
+                continue;
+            InventoryResult res = EQUIP_ERR_OK;
+            LootItem* taken = bot->StoreLootItem(i, loot, res);
+            if (res == EQUIP_ERR_OK && taken)
+            {
+                ++itemsTaken;
+                if (ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(taken->itemid))
+                {
+                    takenList.push_back({
+                        {"entry", taken->itemid},
+                        {"name",  tpl->Name1},
+                        {"count", static_cast<int>(taken->count)}
+                    });
+                }
+                else
+                {
+                    takenList.push_back({{"entry", taken->itemid}, {"count", static_cast<int>(taken->count)}});
+                }
+            }
+        }
+
+        // Money: take everything. Mirrors HandleLootMoneyOpcode's
+        // single-looter (non-group) path.
+        uint32 moneyTaken = loot->gold;
+        if (moneyTaken > 0)
+        {
+            if (Group* group = bot->GetGroup())
+            {
+                // Group present — split via the same path the handler
+                // would. Simplest: just give the bot its share or
+                // skip — for now, single-looter gets all the gold.
+                // (Group loot money distribution is in
+                // HandleLootMoneyOpcode; we skip the split for v1.)
+                bot->ModifyMoney(moneyTaken);
+                (void)group;
+            }
+            else
+            {
+                bot->ModifyMoney(moneyTaken);
+            }
+            loot->gold = 0;
+            loot->NotifyMoneyRemoved();
+        }
+
+        bot->SendLootRelease(lguid);
+
+        return json{
+            {"ok",            true},
+            {"verb",          "loot_target"},
+            {"guid",          intent.guid},
+            {"items_taken",   itemsTaken},
+            {"copper_taken",  moneyTaken},
+            {"items",         takenList}
+        }.dump();
+    }
+    namespace
+    {
+        // Find the nearest mailbox gameobject within INTERACTION_DISTANCE.
+        // Mail verbs need this since CanOpenMailBox checks distance to a
+        // specific mailbox. Returns ObjectGuid::Empty if none in range.
+        ObjectGuid FindNearbyMailboxGuid(Player* bot)
+        {
+            std::list<GameObject*> gos;
+            bot->GetGameObjectListWithEntryInGrid(gos, 0, INTERACTION_DISTANCE);
+            for (GameObject* go : gos)
+            {
+                if (go && go->GetGoType() == GAMEOBJECT_TYPE_MAILBOX)
+                    return go->GetGUID();
+            }
+            return ObjectGuid::Empty;
+        }
+    }
+
+    std::string SbywowAgentEngine::ExecuteMailSend(Player* bot, Intent const& intent)
+    {
+        if (intent.strParam1.empty())
+            return json{{"ok", false}, {"error", "mail_send requires recipient"}}.dump();
+
+        ObjectGuid mailbox = FindNearbyMailboxGuid(bot);
+        if (!mailbox)
+            return json{{"ok", false}, {"error", "no mailbox in interact range"}}.dump();
+
+        // Construct the SendMail packet body. The handler reads:
+        //   mailbox guid, recipient string, subject, body, unk1, unk2,
+        //   item_count, [items...], money, COD, unk3, unk4
+        WorldPacket data(CMSG_SEND_MAIL, 64);
+        data << mailbox;
+        data << intent.strParam1;          // recipient
+        data << intent.strParam2;          // subject
+        data << intent.strParam3;          // body
+        data << uint32(0x00000000);        // unk1 stationery
+        data << uint32(0x00000000);        // unk2
+        uint8 itemsCount = intent.itemGuid ? 1 : 0;
+        data << uint8(itemsCount);
+        if (itemsCount > 0)
+        {
+            data << uint8(0);                  // mail item slot, unused
+            data << ObjectGuid(intent.itemGuid);
+        }
+        data << uint32(intent.copper);     // money
+        data << uint32(0);                 // COD
+        data << uint64(0);                 // unk3
+        data << uint8(0);                  // unk4
+
+        bot->GetSession()->HandleSendMail(data);
+
+        return json{
+            {"ok",          true},
+            {"verb",        "mail_send"},
+            {"recipient",   intent.strParam1},
+            {"subject",     intent.strParam2},
+            {"item_guid",   intent.itemGuid},
+            {"copper",      intent.copper},
+            {"mailbox",     mailbox.GetRawValue()}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteMailTakeItem(Player* bot, Intent const& intent)
+    {
+        if (!intent.mailId)
+            return json{{"ok", false}, {"error", "mail_take_item requires mail_id"}}.dump();
+        if (!intent.itemGuid)
+            return json{{"ok", false}, {"error", "mail_take_item requires item_guid"}}.dump();
+        ObjectGuid mailbox = FindNearbyMailboxGuid(bot);
+        if (!mailbox)
+            return json{{"ok", false}, {"error", "no mailbox in interact range"}}.dump();
+
+        WorldPacket data(CMSG_MAIL_TAKE_ITEM, 8 + 4 + 4);
+        data << mailbox;
+        data << uint32(intent.mailId);
+        data << uint32(ObjectGuid(intent.itemGuid).GetCounter());
+        bot->GetSession()->HandleMailTakeItem(data);
+
+        return json{
+            {"ok",        true},
+            {"verb",      "mail_take_item"},
+            {"mail_id",   intent.mailId},
+            {"item_guid", intent.itemGuid}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteMailTakeMoney(Player* bot, Intent const& intent)
+    {
+        if (!intent.mailId)
+            return json{{"ok", false}, {"error", "mail_take_money requires mail_id"}}.dump();
+        ObjectGuid mailbox = FindNearbyMailboxGuid(bot);
+        if (!mailbox)
+            return json{{"ok", false}, {"error", "no mailbox in interact range"}}.dump();
+
+        uint32 moneyBefore = bot->GetMoney();
+        WorldPacket data(CMSG_MAIL_TAKE_MONEY, 8 + 4);
+        data << mailbox;
+        data << uint32(intent.mailId);
+        bot->GetSession()->HandleMailTakeMoney(data);
+
+        return json{
+            {"ok",            true},
+            {"verb",          "mail_take_money"},
+            {"mail_id",       intent.mailId},
+            {"copper_before", moneyBefore},
+            {"copper_after",  bot->GetMoney()},
+            {"copper_gained", bot->GetMoney() - moneyBefore}
+        }.dump();
+    }
+    std::string SbywowAgentEngine::ExecuteQuestAccept(Player* bot, Intent const& intent)
+    {
+        if (!intent.questId)
+            return json{{"ok", false}, {"error", "quest_accept requires quest_id"}}.dump();
+        Quest const* quest = sObjectMgr->GetQuestTemplate(intent.questId);
+        if (!quest)
+            return json{{"ok", false}, {"error", "unknown quest_id"}, {"quest_id", intent.questId}}.dump();
+        if (!bot->CanTakeQuest(quest, true))
+            return json{
+                {"ok",       false},
+                {"error",    "bot cannot take this quest (level/prereq/repeatable)"},
+                {"quest_id", intent.questId}
+            }.dump();
+
+        // The questgiver is required for AddQuestAndCheckCompletion's
+        // OnQuestAccept hooks, but is allowed to be the bot itself for
+        // self-given quests. If the agent supplied an npc_guid, prefer
+        // that; else use the bot.
+        Object* giver = bot;
+        if (intent.guid)
+        {
+            if (Object* o = ObjectAccessor::GetObjectByTypeMask(*bot, ObjectGuid(intent.guid),
+                    TYPEMASK_UNIT | TYPEMASK_GAMEOBJECT | TYPEMASK_ITEM))
+                giver = o;
+        }
+        bot->AddQuestAndCheckCompletion(quest, giver);
+
+        return json{
+            {"ok",       true},
+            {"verb",     "quest_accept"},
+            {"quest_id", intent.questId},
+            {"title",    quest->GetTitle()}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteQuestComplete(Player* bot, Intent const& intent)
+    {
+        if (!intent.questId)
+            return json{{"ok", false}, {"error", "quest_complete requires quest_id"}}.dump();
+        Quest const* quest = sObjectMgr->GetQuestTemplate(intent.questId);
+        if (!quest)
+            return json{{"ok", false}, {"error", "unknown quest_id"}, {"quest_id", intent.questId}}.dump();
+        if (!bot->CanCompleteQuest(intent.questId))
+            return json{
+                {"ok",       false},
+                {"error",    "quest not yet completable (objectives unmet)"},
+                {"quest_id", intent.questId}
+            }.dump();
+        if (!bot->CanRewardQuest(quest, true))
+            return json{
+                {"ok",       false},
+                {"error",    "bot cannot accept reward (bag full / item cap)"},
+                {"quest_id", intent.questId}
+            }.dump();
+
+        Object* giver = bot;
+        if (intent.guid)
+        {
+            if (Object* o = ObjectAccessor::GetObjectByTypeMask(*bot, ObjectGuid(intent.guid),
+                    TYPEMASK_UNIT | TYPEMASK_GAMEOBJECT))
+                giver = o;
+        }
+        // reward index 0 — picks first reward choice; agent harness can
+        // explicitly pre-select via a richer reward arg in a future
+        // polish pass.
+        bot->RewardQuest(quest, /*reward=*/0, giver, /*announce=*/true);
+
+        return json{
+            {"ok",       true},
+            {"verb",     "quest_complete"},
+            {"quest_id", intent.questId},
+            {"title",    quest->GetTitle()}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteQuestAbandon(Player* bot, Intent const& intent)
+    {
+        if (!intent.questId)
+            return json{{"ok", false}, {"error", "quest_abandon requires quest_id"}}.dump();
+        uint16 slot = bot->FindQuestSlot(intent.questId);
+        if (slot >= MAX_QUEST_LOG_SIZE)
+            return json{
+                {"ok",       false},
+                {"error",    "quest not in log"},
+                {"quest_id", intent.questId}
+            }.dump();
+        bot->TakeQuestSourceItem(intent.questId, true);
+        bot->AbandonQuest(intent.questId);
+        bot->RemoveActiveQuest(intent.questId);
+        bot->SetQuestSlot(slot, 0);
+        return json{
+            {"ok",       true},
+            {"verb",     "quest_abandon"},
+            {"quest_id", intent.questId},
+            {"slot",     slot}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteQuestShare(Player* bot, Intent const& intent)
+    {
+        if (!intent.questId)
+            return json{{"ok", false}, {"error", "quest_share requires quest_id"}}.dump();
+        if (!bot->GetGroup())
+            return json{{"ok", false}, {"error", "bot is not in a group"}}.dump();
+        // HandlePushQuestToParty reads just questId; construct + dispatch.
+        WorldPacket data(CMSG_PUSHQUESTTOPARTY, 4);
+        data << uint32(intent.questId);
+        bot->GetSession()->HandlePushQuestToParty(data);
+        return json{
+            {"ok",       true},
+            {"verb",     "quest_share"},
+            {"quest_id", intent.questId}
+        }.dump();
+    }
+    std::string SbywowAgentEngine::ExecuteGroupAcceptInvite(Player* bot, Intent const& /*intent*/)
+    {
+        if (!bot->GetGroupInvite())
+            return json{{"ok", false}, {"error", "no pending group invite"}}.dump();
+        WorldPacket data(CMSG_GROUP_ACCEPT, 4);
+        data << uint32(0);
+        bot->GetSession()->HandleGroupAcceptOpcode(data);
+        return json{{"ok", true}, {"verb", "group_accept_invite"}}.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteGroupDeclineInvite(Player* bot, Intent const& /*intent*/)
+    {
+        if (!bot->GetGroupInvite())
+            return json{{"ok", false}, {"error", "no pending group invite"}}.dump();
+        WorldPacket data(CMSG_GROUP_DECLINE, 0);
+        bot->GetSession()->HandleGroupDeclineOpcode(data);
+        return json{{"ok", true}, {"verb", "group_decline_invite"}}.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteGroupLeave(Player* bot, Intent const& /*intent*/)
+    {
+        if (!bot->GetGroup())
+            return json{{"ok", false}, {"error", "bot is not in a group"}}.dump();
+        WorldPacket data(CMSG_GROUP_DISBAND, 0);
+        bot->GetSession()->HandleGroupDisbandOpcode(data);
+        return json{{"ok", true}, {"verb", "group_leave"}}.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteGroupPromoteLeader(Player* bot, Intent const& intent)
+    {
+        if (!bot->GetGroup())
+            return json{{"ok", false}, {"error", "bot is not in a group"}}.dump();
+        if (!intent.guid)
+            return json{{"ok", false}, {"error", "group_promote_leader requires target_guid"}}.dump();
+        WorldPacket data(CMSG_GROUP_SET_LEADER, 8);
+        data << ObjectGuid(intent.guid);
+        bot->GetSession()->HandleGroupSetLeaderOpcode(data);
+        return json{
+            {"ok",          true},
+            {"verb",        "group_promote_leader"},
+            {"target_guid", intent.guid}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteGroupReadyCheckRespond(Player* bot, Intent const& intent)
+    {
+        if (!bot->GetGroup())
+            return json{{"ok", false}, {"error", "bot is not in a group"}}.dump();
+        // intParam: 1 = ready, 0 = not ready (default to ready when
+        // unset so the verb is a one-shot "yes" by default).
+        uint8 state = (intent.intParam == 0) ? 0 : 1;
+        WorldPacket data(MSG_RAID_READY_CHECK, 1);
+        data << uint8(state);
+        bot->GetSession()->HandleRaidReadyCheckOpcode(data);
+        return json{
+            {"ok",    true},
+            {"verb",  "group_ready_check_respond"},
+            {"ready", state == 1}
+        }.dump();
+    }
 
     bool SbywowAgentEngine::CancelWaitIfMatch(uint64_t intentId)
     {
