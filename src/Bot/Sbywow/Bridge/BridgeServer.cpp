@@ -29,6 +29,10 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "SharedDefines.h"
+#include "SpellAuras.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include "Timer.h"
 #include "Value.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
@@ -42,6 +46,7 @@
 #include <chrono>
 #include <functional>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -406,6 +411,115 @@ namespace Sbywow::Bridge
             }
         }
 
+        // Build a {guid, name, kind, hostile, hp_pct, alive} target sub-block
+        // for a Unit (the bot or its master). Returns null when the unit
+        // has no target or the target can't be resolved.
+        json BuildTargetBlock(Unit* viewer)
+        {
+            if (!viewer)
+                return nullptr;
+            ObjectGuid tgtGuid = viewer->GetTarget();
+            if (!tgtGuid)
+                return nullptr;
+            Unit* tgt = ObjectAccessor::GetUnit(*viewer, tgtGuid);
+            if (!tgt)
+                return nullptr;
+            char const* kind = "unit";
+            if (tgt->ToCreature())    kind = "creature";
+            else if (tgt->ToPlayer()) kind = "player";
+            return json{
+                {"guid",    tgtGuid.GetRawValue()},
+                {"name",    tgt->GetName()},
+                {"kind",    kind},
+                {"hostile", tgt->IsHostileTo(viewer)},
+                {"hp_pct",  static_cast<int>(tgt->GetHealthPct())},
+                {"alive",   tgt->IsAlive()}
+            };
+        }
+
+        // Bot's own auras — positive non-passive only, deduped by spell_id
+        // (AuraApplicationMap is a multimap keyed per-effect; one Aura with
+        // three effects contributes three entries). Capped at kAuraCap to
+        // bound payload during heavy buff windows. Permanent buffs report
+        // remaining_ms = -1 so the agent can distinguish "always-up" from
+        // a 5-minute Fortitude that's about to fall off.
+        json BuildAurasBlock(Player* bot)
+        {
+            constexpr size_t kAuraCap = 20;
+            json arr = json::array();
+            std::set<uint32> seen;
+            for (auto const& [spellId, aurApp] : bot->GetAppliedAuras())
+            {
+                if (!aurApp || !aurApp->IsPositive())
+                    continue;
+                Aura* base = aurApp->GetBase();
+                if (!base || base->IsPassive())
+                    continue;
+                if (!seen.insert(spellId).second)
+                    continue;
+                SpellInfo const* si = base->GetSpellInfo();
+                if (!si)
+                    continue;
+                json one = {
+                    {"spell_id",     spellId},
+                    {"name",         si->SpellName[0] ? si->SpellName[0] : ""},
+                    {"stacks",       static_cast<int>(base->GetStackAmount())},
+                    {"remaining_ms", base->IsPermanent() ? -1 : base->GetDuration()}
+                };
+                arr.push_back(std::move(one));
+                if (arr.size() >= kAuraCap)
+                    break;
+            }
+            return arr;
+        }
+
+        // Bot's spell cooldowns longer than kCooldownThresholdMs remaining.
+        // Filters out the GCD chatter (1.5s rotation cooldowns aren't useful
+        // for executive function planning); long CDs (Fade, Power Infusion,
+        // Bestial Wrath, etc.) are what the agent times.
+        json BuildCooldownsBlock(Player* bot)
+        {
+            constexpr uint32 kCooldownThresholdMs = 5000;
+            constexpr size_t kCooldownCap = 30;
+            json arr = json::array();
+            uint32 now = getMSTime();
+            for (auto const& [spellId, cd] : bot->GetSpellCooldownMap())
+            {
+                if (cd.end <= now)
+                    continue;
+                uint32 remaining = cd.end - now;
+                if (remaining < kCooldownThresholdMs)
+                    continue;
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
+                if (!si)
+                    continue;
+                arr.push_back(json{
+                    {"spell_id",     spellId},
+                    {"name",         si->SpellName[0] ? si->SpellName[0] : ""},
+                    {"remaining_ms", remaining}
+                });
+                if (arr.size() >= kCooldownCap)
+                    break;
+            }
+            return arr;
+        }
+
+        // Trade window snapshot. Returns null when no trade window is
+        // open. Wired in Batch 2 — reads bot->GetSession()->GetTradeData()
+        // for self/partner offers, accepted flags, partner identity.
+        json BuildTradeBlock(Player* /*bot*/)
+        {
+            return nullptr;
+        }
+
+        // Gossip menu snapshot. Returns null when no menu is open.
+        // Wired in Batch 4 — reads bot->PlayerTalkClass->GetGossipMenu()
+        // for the option list (index, text, type).
+        json BuildGossipBlock(Player* /*bot*/)
+        {
+            return nullptr;
+        }
+
         // Count used vs. total non-equipped, non-keyring slots:
         // backpack 16 + each bag's GetBagSize.
         void CountInventorySlots(Player* bot, int& used, int& total)
@@ -441,6 +555,11 @@ namespace Sbywow::Bridge
         uint32 health    = bot->GetHealth();
         uint32 healthMax = bot->GetMaxHealth();
         json power       = BuildPowerBlock(bot);
+        bool   resting   = bot->HasRestFlag(REST_FLAG_IN_TAVERN) ||
+                           bot->HasRestFlag(REST_FLAG_IN_CITY)   ||
+                           bot->HasRestFlag(REST_FLAG_IN_FACTION_AREA);
+        uint32 xpCur     = bot->GetUInt32Value(PLAYER_XP);
+        uint32 xpNext    = bot->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
         json self = {
             {"name",       bot->GetName()},
             {"level",      bot->GetLevel()},
@@ -460,7 +579,14 @@ namespace Sbywow::Bridge
             {"alive",      bot->IsAlive()},
             {"in_combat",  bot->IsInCombat()},
             {"mounted",    bot->IsMounted()},
-            {"afk",        bot->isAFK()}
+            {"afk",        bot->isAFK()},
+            {"resting",    resting},
+            {"rest_bonus", bot->GetRestBonus()},
+            {"xp",         xpCur},
+            {"xp_next",    xpNext},
+            {"target",     BuildTargetBlock(bot)},
+            {"auras",      BuildAurasBlock(bot)},
+            {"cooldowns",  BuildCooldownsBlock(bot)}
         };
 
         // ---- master ----
@@ -471,26 +597,6 @@ namespace Sbywow::Bridge
             uint32 mh  = master->GetHealth();
             uint32 mhm = master->GetMaxHealth();
             json mpower = BuildPowerBlock(master);
-
-            json target = nullptr;
-            ObjectGuid targetGuid = master->GetTarget();
-            if (targetGuid)
-            {
-                if (Unit* tgt = ObjectAccessor::GetUnit(*master, targetGuid))
-                {
-                    char const* kind = "unit";
-                    if (tgt->ToCreature())    kind = "creature";
-                    else if (tgt->ToPlayer()) kind = "player";
-                    target = {
-                        {"guid",    targetGuid.GetRawValue()},
-                        {"name",    tgt->GetName()},
-                        {"kind",    kind},
-                        {"hostile", tgt->IsHostileTo(master)},
-                        {"hp_pct",  static_cast<int>(tgt->GetHealthPct())},
-                        {"alive",   tgt->IsAlive()}
-                    };
-                }
-            }
 
             masterJson = {
                 {"name",       master->GetName()},
@@ -512,7 +618,7 @@ namespace Sbywow::Bridge
                 {"in_combat",  master->IsInCombat()},
                 {"mounted",    master->IsMounted()},
                 {"afk",        master->isAFK()},
-                {"target",     target}
+                {"target",     BuildTargetBlock(master)}
             };
         }
 
@@ -664,7 +770,11 @@ namespace Sbywow::Bridge
             uint32 c = money % 100;
 
             // Render consumables: per-bucket {total, items: [{entry, name, count}]}.
-            // Buckets included only if non-empty (sparse object).
+            // Buckets included only if non-empty (sparse object). The
+            // `low` flag is set on the regen-critical buckets (food_drink,
+            // bandage) when their total drops below kConsumableLowThreshold;
+            // it's the agent's "go restock" signal.
+            constexpr uint32 kConsumableLowThreshold = 5;
             json consumablesJson = json::object();
             for (auto const& [bucket, total] : consumableTotals)
             {
@@ -681,10 +791,22 @@ namespace Sbywow::Bridge
                         });
                     }
                 }
-                consumablesJson[bucket] = {
+                json bucketJson = {
                     {"total", total},
                     {"items", items}
                 };
+                bool isRegenBucket = (bucket == "food_drink" || bucket == "bandage");
+                if (isRegenBucket && total < kConsumableLowThreshold)
+                    bucketJson["low"] = true;
+                consumablesJson[bucket] = std::move(bucketJson);
+            }
+            // Also surface "low: true" for regen buckets that are completely
+            // absent — empty bucket = nothing in inventory at all, which is
+            // the truly-low state.
+            for (char const* regen : {"food_drink", "bandage"})
+            {
+                if (consumableTotals.find(regen) == consumableTotals.end())
+                    consumablesJson[regen] = {{"total", 0}, {"items", json::array()}, {"low", true}};
             }
 
             inventory = {
@@ -798,11 +920,22 @@ namespace Sbywow::Bridge
             {"reactives_fired_total",    reactivesTotal}
         };
 
+        // ---- trade / gossip ----
+        // Top-level fields populated by their respective wirings (trade
+        // in Batch 2 from WorldSession::GetTradeData, gossip in Batch 4
+        // from PlayerTalkClass). Null when no window is open. Schema
+        // surface lands here up front so consumers can rely on the
+        // fields existing.
+        json tradeJson  = BuildTradeBlock(bot);
+        json gossipJson = BuildGossipBlock(bot);
+
         return json{
             {"self",           self},
             {"master",         masterJson},
             {"inventory",      inventory},
             {"group",          groupJson},
+            {"trade",          tradeJson},
+            {"gossip",         gossipJson},
             {"active_intents", activeIntents},
             {"session",        session}
         };
