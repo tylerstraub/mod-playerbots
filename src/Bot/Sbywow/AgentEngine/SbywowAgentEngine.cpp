@@ -18,7 +18,10 @@
 #include "ItemPackets.h"
 #include "Log.h"
 #include "LootMgr.h"
+#include "GridTerrainData.h"  // INVALID_HEIGHT
+#include "Map.h"
 #include "MotionMaster.h"
+#include "MovementGenerators/PathGenerator.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -807,7 +810,95 @@ namespace Sbywow
         float fromX = bot->GetPositionX();
         float fromY = bot->GetPositionY();
         float fromZ = bot->GetPositionZ();
-        float dist  = bot->GetExactDist(intent.x, intent.y, intent.z);
+
+        // ---- Defensive validation (Batch H, post-2026-05-03 e2e) ------
+        // Agents will routinely supply rough x/y/z coords (LLM-derived,
+        // user-typed, etc.). Without validation, bad Z + cliff terrain +
+        // sparse mmap coverage produces the "flying through the air"
+        // glitch the user reported during the grind setup. Three layers:
+        //
+        //   1. Snap Z to terrain when wildly off (>5y delta).
+        //   2. Pre-flight PathGenerator to verify a navigable path
+        //      exists before dispatching MovePoint.
+        //   3. Reject paths that would shortcut through geometry or
+        //      land far from the intended polygon.
+        //
+        // --target mode (Batch B) bypasses these issues at the source
+        // since target positions are by definition real terrain coords;
+        // raw x/y/z from the agent gets the full safety treatment.
+        float targetX = intent.x;
+        float targetY = intent.y;
+        float targetZ = intent.z;
+        float zSnapDelta = 0.f;
+        bool zWasSnapped = false;
+        if (Map* map = bot->GetMap())
+        {
+            // Probe terrain Z. Search downward from a generous height
+            // above the agent's claimed Z (catches "I gave Z=25 but
+            // terrain is Z=50" by searching from 75 down).
+            float probeZ = targetZ + 50.f;
+            float terrainZ = map->GetHeight(targetX, targetY, probeZ,
+                                            /*checkVMap=*/ true,
+                                            DEFAULT_HEIGHT_SEARCH);
+            if (terrainZ > INVALID_HEIGHT)
+            {
+                float delta = std::abs(targetZ - terrainZ);
+                if (delta > 5.0f)
+                {
+                    // Snap to terrain + 0.5y to avoid clipping into the
+                    // floor on splines. Surface the snap so the agent
+                    // can learn its coords are off.
+                    zSnapDelta = terrainZ - targetZ;
+                    targetZ = terrainZ + 0.5f;
+                    zWasSnapped = true;
+                }
+            }
+        }
+
+        // Path pre-flight. If the path can't be built, no point asking
+        // MovePoint to try — the spline engine's behavior on no-mmap or
+        // off-mesh destinations is to fall through to straight-line
+        // (looks like flying / clipping). Reject before dispatch.
+        PathType pathType = PATHFIND_BLANK;
+        {
+            PathGenerator path(bot);
+            path.CalculatePath(targetX, targetY, targetZ, /*forceDest=*/ false);
+            pathType = path.GetPathType();
+        }
+
+        auto pathTypeName = [](PathType t) -> char const* {
+            if (t & PATHFIND_NORMAL)         return "normal";
+            if (t & PATHFIND_SHORTCUT)       return "shortcut";  // bad
+            if (t & PATHFIND_INCOMPLETE)     return "incomplete";
+            if (t & PATHFIND_NOPATH)         return "no_path";
+            if (t & PATHFIND_NOT_USING_PATH) return "no_mmap";
+            if (t & PATHFIND_SHORT)          return "short";
+            if (t & PATHFIND_FARFROMPOLY)    return "far_from_poly";
+            return "blank";
+        };
+
+        // Hard rejects — these signal the path would not work properly.
+        // SHORTCUT means the spline would cut through geometry; NOPATH
+        // means dest is unreachable; NOT_USING_PATH means we're outside
+        // mmap coverage and can't navigate safely; FARFROMPOLY means the
+        // start or end isn't on the navmesh (would clip).
+        if ((pathType & PATHFIND_SHORTCUT) ||
+            (pathType & PATHFIND_NOPATH)   ||
+            (pathType & PATHFIND_NOT_USING_PATH) ||
+            (pathType & PATHFIND_FARFROMPOLY))
+        {
+            return json{
+                {"ok",            false},
+                {"reason",        "unsafe_path"},
+                {"path_type",     pathTypeName(pathType)},
+                {"path_type_raw", static_cast<int>(pathType)},
+                {"error",         "destination unreachable / off-mesh / would clip — use --target <guid> for a guaranteed-valid coord"},
+                {"to",            {intent.x, intent.y, intent.z}},
+                {"z_snapped_to",  zWasSnapped ? targetZ : intent.z}
+            }.dump();
+        }
+
+        float dist = bot->GetExactDist(targetX, targetY, targetZ);
 
         // Match mod-playerbots' MovementAction::DoMovePoint shape:
         // stand up if sitting, then Clear() and MovePoint with
@@ -817,19 +908,37 @@ namespace Sbywow
         if (bot->IsSitState())
             bot->SetStandState(UNIT_STAND_STATE_STAND);
         mm->Clear();
-        mm->MovePoint(/*id*/ 0, intent.x, intent.y, intent.z, FORCED_MOVEMENT_NONE,
+        mm->MovePoint(/*id*/ 0, targetX, targetY, targetZ, FORCED_MOVEMENT_NONE,
                       /*speed*/ 0.f, /*orientation*/ 0.f,
                       /*generatePath*/ true,
                       /*forceDestination*/ false);
 
-        return json{
-            {"ok",       true},
+        // Verify a generator was actually pushed. If not, MovePoint
+        // silently no-op'd and the bot won't move.
+        bool generatorRunning =
+            mm->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
+
+        json result = {
+            {"ok",       generatorRunning},
             {"verb",     "move_to"},
             {"map",      bot->GetMapId()},
             {"from",     {fromX, fromY, fromZ}},
-            {"to",       {intent.x, intent.y, intent.z}},
-            {"distance", dist}
-        }.dump();
+            {"to",       {targetX, targetY, targetZ}},
+            {"requested",{intent.x, intent.y, intent.z}},
+            {"distance", dist},
+            {"path_type", pathTypeName(pathType)}
+        };
+        if (zWasSnapped)
+        {
+            result["z_snapped"]       = true;
+            result["z_snap_delta"]    = zSnapDelta;
+        }
+        if (!generatorRunning)
+        {
+            result["reason"] = "generator_not_started";
+            result["error"]  = "MovePoint dispatched but no generator running — likely path-gen failure";
+        }
+        return result.dump();
     }
 
     namespace
