@@ -2137,11 +2137,14 @@ namespace Sbywow::Bridge
 
         std::string DoFindNearby(Player* bot, json const& req)
         {
-            // Range default 30 yards, capped at 200 to keep the grid
-            // visit bounded. For comparison the player visibility range
-            // is ~100 yards on most maps; 200 is generous.
+            // Range default 60 yards (was 30; bumped 2026-05-02 after
+            // the e2e fetch-and-deliver session showed the default was
+            // too narrow for "post-hearth, find vendors in town"
+            // patterns — BB needed ~150y to see all vendors). Capped at
+            // 200 to keep the grid visit bounded; player visibility is
+            // ~100y on most maps.
             float range = req.contains("range") && req["range"].is_number()
-                          ? req["range"].get<float>() : 30.0f;
+                          ? req["range"].get<float>() : 60.0f;
             if (range < 0.f)   range = 0.f;
             if (range > 200.f) range = 200.f;
 
@@ -2156,6 +2159,25 @@ namespace Sbywow::Bridge
                     if      (s == "creature")   wantCreatures = true;
                     else if (s == "player")     wantPlayers = true;
                     else if (s == "gameobject") wantGameObjects = true;
+                }
+            }
+
+            // Optional flag filter: only return creatures whose decoded
+            // flags array contains AT LEAST ONE of the requested tags
+            // (OR semantics — useful for "find me any kind of merchant"
+            // = ["vendor", "repair"]). Empty means no filter. Doesn't
+            // apply to players or gameobjects since they don't have NPC
+            // role flags. If `flags` is set and `kinds` was empty, also
+            // narrow `kinds` to "creature" to skip the wasted iteration.
+            std::vector<std::string> flagFilter;
+            if (req.contains("flags") && req["flags"].is_array())
+            {
+                for (auto const& f : req["flags"])
+                    if (f.is_string()) flagFilter.push_back(f.get<std::string>());
+                if (!flagFilter.empty() && !req.contains("kinds"))
+                {
+                    wantPlayers = false;
+                    wantGameObjects = false;
                 }
             }
 
@@ -2191,6 +2213,16 @@ namespace Sbywow::Bridge
                 {
                     if (!wantCreatures) continue;
                     if (aliveOnly && !c->IsAlive()) continue;
+                    json flags = DecodeCreatureFlags(c);
+                    if (!flagFilter.empty())
+                    {
+                        bool match = false;
+                        for (auto const& want : flagFilter)
+                            for (auto const& got : flags)
+                                if (got.is_string() && got.get<std::string>() == want)
+                                { match = true; break; }
+                        if (!match) continue;
+                    }
                     float d = bot->GetExactDist(c);
                     json item = {
                         {"kind",    "creature"},
@@ -2205,7 +2237,7 @@ namespace Sbywow::Bridge
                         {"hp_pct",  static_cast<int>(c->GetHealthPct())},
                         {"alive",   c->IsAlive()},
                         {"hostile", c->IsHostileTo(bot)},
-                        {"flags",   DecodeCreatureFlags(c)}
+                        {"flags",   std::move(flags)}
                     };
                     scored.emplace_back(d, std::move(item));
                 }
