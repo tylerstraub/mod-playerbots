@@ -64,6 +64,11 @@ namespace Sbywow
         GroupLeave,
         GroupPromoteLeader,
         GroupReadyCheckRespond,
+
+        // Batch 6 — perception / movement / trade-flow primitives.
+        TradeAcceptInvite,           // CMSG_BEGIN_TRADE — accept a pending trade invitation
+        FaceTarget,                  // SetFacingTo a unit
+        ComeBack,                    // move to current master position
     };
 
     struct Intent

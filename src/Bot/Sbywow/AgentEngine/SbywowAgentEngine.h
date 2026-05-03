@@ -220,6 +220,12 @@ namespace Sbywow
         std::string ExecuteGroupPromoteLeader (Player* bot, Intent const& intent);
         std::string ExecuteGroupReadyCheckRespond(Player* bot, Intent const& intent);
 
+        // Batch 6 — perception / movement / trade-flow primitives.
+        // (ComeBack is rewritten in the queue drain into a Move using
+        // the master's current position, so no Execute fn here.)
+        std::string ExecuteTradeAcceptInvite  (Player* bot, Intent const& intent);
+        std::string ExecuteFaceTarget         (Player* bot, Intent const& intent);
+
         // Reactive autonomic: fire upstream "food"/"drink" actions
         // when the bot is idle (no queued intents, no wait active)
         // at low cadence. The actions self-gate via isUseful() so

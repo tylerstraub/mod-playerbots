@@ -1606,6 +1606,45 @@ namespace Sbywow::Bridge
             return Defer(bot, sess, cmd, "trade_cancel", std::move(i));
         }
 
+        std::string QueueTradeAcceptInviteIntent(Player* bot, BotSession& sess,
+                                                 std::shared_ptr<PendingCommand>& cmd,
+                                                 json const& /*req*/)
+        {
+            // Equivalent to a real player clicking the "Trade" button on
+            // the popup — fires CMSG_BEGIN_TRADE handler which opens
+            // both windows. Real-player UI does this automatically;
+            // service-account mercs have no UI thread, hence the
+            // explicit verb. See decisions for why
+            // TradeStatusAction.BeginTrade doesn't fire for our mercs.
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::TradeAcceptInvite;
+            return Defer(bot, sess, cmd, "trade_accept_invite", std::move(i));
+        }
+
+        std::string QueueFaceTargetIntent(Player* bot, BotSession& sess,
+                                          std::shared_ptr<PendingCommand>& cmd,
+                                          json const& req)
+        {
+            if (!req.contains("target_guid") || !req["target_guid"].is_number())
+                return json{{"ok", false}, {"error", "face_target requires target_guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::FaceTarget;
+            i.guid = req["target_guid"].get<uint64_t>();
+            return Defer(bot, sess, cmd, "face_target", std::move(i));
+        }
+
+        std::string QueueComeBackIntent(Player* bot, BotSession& sess,
+                                        std::shared_ptr<PendingCommand>& cmd,
+                                        json const& /*req*/)
+        {
+            // Engine resolves master position at execute time so the
+            // intent doesn't go stale if the master moves between
+            // dispatch and execute.
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::ComeBack;
+            return Defer(bot, sess, cmd, "come_back", std::move(i));
+        }
+
         std::string QueueEquipItemIntent(Player* bot, BotSession& sess,
                                          std::shared_ptr<PendingCommand>& cmd,
                                          json const& req)
@@ -1853,6 +1892,56 @@ namespace Sbywow::Bridge
                 {"ok",   true},
                 {"verb", "reset_cooldowns"},
                 {"all",  true}
+            }.dump();
+        }
+
+        // ---- Sync perception: find_player -------------------------------
+        //
+        // Resolve a player by exact (case-insensitive) name to a guid +
+        // basic context. Pure read; no client packets, no state mutation.
+        // Returns null when no online player matches — agent gets a
+        // clear "not found" rather than having to fall back to DB.
+        std::string DoFindPlayer(Player* bot, json const& req)
+        {
+            if (!req.contains("name") || !req["name"].is_string())
+                return json{{"ok", false}, {"error", "find_player requires name"}}.dump();
+            std::string name = req["name"].get<std::string>();
+            if (name.empty())
+                return json{{"ok", false}, {"error", "find_player name is empty"}}.dump();
+
+            // ObjectAccessor::FindPlayerByName is case-insensitive and
+            // matches against in-world online players only. For matching
+            // offline characters (mail, trade history) the agent would
+            // need a DB lookup — out of scope for this verb.
+            Player* p = ObjectAccessor::FindPlayerByName(name, /*checkInWorld=*/ true);
+            if (!p)
+            {
+                return json{
+                    {"ok",    true},
+                    {"verb",  "find_player"},
+                    {"name",  name},
+                    {"found", false}
+                }.dump();
+            }
+            float dist = bot->GetMapId() == p->GetMapId() ? bot->GetExactDist(p) : -1.0f;
+            return json{
+                {"ok",       true},
+                {"verb",     "find_player"},
+                {"found",    true},
+                {"name",     p->GetName()},
+                {"guid",     p->GetGUID().GetRawValue()},
+                {"level",    p->GetLevel()},
+                {"class_id", static_cast<int>(p->getClass())},
+                {"race_id",  static_cast<int>(p->getRace())},
+                {"team_id",  static_cast<int>(p->GetTeamId())},
+                {"map",      p->GetMapId()},
+                {"zone",     p->GetZoneId()},
+                {"area",     p->GetAreaId()},
+                {"position", {p->GetPositionX(), p->GetPositionY(), p->GetPositionZ()}},
+                {"distance", dist},   // -1 when on a different map
+                {"alive",    p->IsAlive()},
+                {"in_combat", p->IsInCombat()},
+                {"mounted",  p->IsMounted()}
             }.dump();
         }
 
@@ -2436,6 +2525,7 @@ namespace Sbywow::Bridge
             // ---- Phase 4 / 5 — vendor / trade / gossip / inventory /
             //       world / mail / quest / group verbs ------------------
             if (verb == "vendor_inventory")           return DoVendorInventory(bot, req);
+            if (verb == "find_player")                return DoFindPlayer(bot, req);
             if (verb == "reset_cooldowns")            return DoResetCooldowns(bot, req);
             if (verb == "buy_item")                   return QueueBuyItemIntent(bot, sess, cmd, req);
             if (verb == "sell_item")                  return QueueSellItemIntent(bot, sess, cmd, req);
@@ -2445,6 +2535,9 @@ namespace Sbywow::Bridge
             if (verb == "trade_offer_money")          return QueueTradeOfferMoneyIntent(bot, sess, cmd, req);
             if (verb == "trade_accept")               return QueueTradeAcceptIntent(bot, sess, cmd, req);
             if (verb == "trade_cancel")               return QueueTradeCancelIntent(bot, sess, cmd, req);
+            if (verb == "trade_accept_invite")        return QueueTradeAcceptInviteIntent(bot, sess, cmd, req);
+            if (verb == "face_target")                return QueueFaceTargetIntent(bot, sess, cmd, req);
+            if (verb == "come_back")                  return QueueComeBackIntent(bot, sess, cmd, req);
             if (verb == "equip_item")                 return QueueEquipItemIntent(bot, sess, cmd, req);
             if (verb == "unequip_item")               return QueueUnequipItemIntent(bot, sess, cmd, req);
             if (verb == "destroy_item")               return QueueDestroyItemIntent(bot, sess, cmd, req);

@@ -277,6 +277,43 @@ namespace Sbywow
             // Move — sub-tick dispatch + multi-tick hold via
             // inFlightMove_. Same shape as before. Stop draining
             // after setting the slot (one blocking dispatch per tick).
+            //
+            // ComeBack is rewritten into a Move at dispatch time using
+            // the master's *current* position, so the agent's intent
+            // doesn't go stale between push and execute. Failure to
+            // resolve master emits a terminal failed inline so the
+            // queue can keep draining.
+            if (popped->intent.kind == IntentKind::ComeBack)
+            {
+                PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+                Player* master = ai ? ai->GetMaster() : nullptr;
+                std::string err;
+                if (!master)
+                    err = "no master assigned";
+                else if (master->GetMapId() != bot->GetMapId())
+                    err = "master is on a different map (cross-map TP needed)";
+                if (!err.empty())
+                {
+                    json result = {{"ok", false}, {"verb", "come_back"}, {"error", err}};
+                    json ev = BuildIntentEvent(bot, "intent_failed",
+                                               popped->intentId, popped->verb);
+                    ev["result"] = result;
+                    session->PushOutbound(ev.dump());
+                    Sbywow::Bridge::BotSession::TerminalIntent rec;
+                    rec.intentId   = popped->intentId;
+                    rec.verb       = popped->verb;
+                    rec.kind       = "intent_failed";
+                    rec.resultJson = result.dump();
+                    session->RecordTerminal(std::move(rec));
+                    continue;
+                }
+                popped->intent.kind = IntentKind::Move;
+                popped->intent.x    = master->GetPositionX();
+                popped->intent.y    = master->GetPositionY();
+                popped->intent.z    = master->GetPositionZ();
+                popped->intent.map  = master->GetMapId();
+                // Fall through into the Move dispatch below.
+            }
             if (popped->intent.kind == IntentKind::Move)
             {
                 if (DispatchMoveIntent(bot, session, popped))
@@ -336,6 +373,7 @@ namespace Sbywow
         {
             case IntentKind::Move:
             case IntentKind::Wait:
+            case IntentKind::ComeBack:   // wraps Move; same in-flight semantics
                 return true;
             case IntentKind::CastSpell:
             {
@@ -689,6 +727,13 @@ namespace Sbywow
             case IntentKind::GroupLeave:             return ExecuteGroupLeave         (bot, intent);
             case IntentKind::GroupPromoteLeader:     return ExecuteGroupPromoteLeader (bot, intent);
             case IntentKind::GroupReadyCheckRespond: return ExecuteGroupReadyCheckRespond(bot, intent);
+            case IntentKind::TradeAcceptInvite:      return ExecuteTradeAcceptInvite  (bot, intent);
+            case IntentKind::FaceTarget:             return ExecuteFaceTarget         (bot, intent);
+            case IntentKind::ComeBack:
+                // ComeBack is intercepted in the queue drain and rewritten
+                // into a Move using the master's current position before
+                // dispatch. Reaching here means a routing bug.
+                return json{{"ok", false}, {"error", "come_back must be handled in queue drain"}}.dump();
         }
         return json{{"ok", false}, {"error", "unknown intent kind"}}.dump();
     }
@@ -1220,6 +1265,62 @@ namespace Sbywow
         bot->GetSession()->HandleCancelTradeOpcode(data);
         return json{{"ok", true}, {"verb", "trade_cancel"}}.dump();
     }
+
+    std::string SbywowAgentEngine::ExecuteTradeAcceptInvite(Player* bot, Intent const& /*intent*/)
+    {
+        // CMSG_BEGIN_TRADE — accepts a pending trade invitation from
+        // another player (the "Trade" button on the popup). Without
+        // this verb our service-account mercs can't accept invitations
+        // because TradeStatusAction.BeginTrade trigger doesn't fire
+        // (root cause TBD — see Batch 9 investigation).
+        TradeData* td = bot->GetTradeData();
+        if (!td)
+            return json{
+                {"ok",    false},
+                {"verb",  "trade_accept_invite"},
+                {"error", "no pending trade invitation"}
+            }.dump();
+        WorldPacket data(CMSG_BEGIN_TRADE, 0);
+        bot->GetSession()->HandleBeginTradeOpcode(data);
+        Player* partner = td->GetTrader();
+        return json{
+            {"ok",            true},
+            {"verb",          "trade_accept_invite"},
+            {"partner_guid",  partner ? partner->GetGUID().GetRawValue() : 0u},
+            {"partner_name",  partner ? partner->GetName() : std::string{}}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteFaceTarget(Player* bot, Intent const& intent)
+    {
+        if (!intent.guid)
+            return json{{"ok", false}, {"error", "face_target requires target_guid"}}.dump();
+        // Try unit first, then gameobject — both have positions and the
+        // agent might want to face either (gossip with NPC, mailbox /
+        // chest object, etc.).
+        ObjectGuid og(intent.guid);
+        WorldObject* target = nullptr;
+        if (Unit* u = ObjectAccessor::GetUnit(*bot, og))
+            target = u;
+        else if (og.IsGameObject())
+            target = bot->GetMap()->GetGameObject(og);
+        if (!target)
+            return json{
+                {"ok",          false},
+                {"verb",        "face_target"},
+                {"error",       "target not found / out of visibility"},
+                {"target_guid", intent.guid}
+            }.dump();
+        bot->SetFacingToObject(target);
+        return json{
+            {"ok",          true},
+            {"verb",        "face_target"},
+            {"target_guid", intent.guid},
+            {"target_name", target->GetName()},
+            {"facing",      bot->GetOrientation()}
+        }.dump();
+    }
+
     std::string SbywowAgentEngine::ExecuteEquipItem(Player* bot, Intent const& intent)
     {
         if (!intent.itemGuid && !intent.itemEntry)

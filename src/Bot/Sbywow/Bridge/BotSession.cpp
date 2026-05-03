@@ -110,6 +110,9 @@ namespace Sbywow::Bridge
                 case Sbywow::IntentKind::GroupLeave:             kindName = "group_leave"; break;
                 case Sbywow::IntentKind::GroupPromoteLeader:     kindName = "group_promote_leader"; break;
                 case Sbywow::IntentKind::GroupReadyCheckRespond: kindName = "group_ready_check_respond"; break;
+                case Sbywow::IntentKind::TradeAcceptInvite:      kindName = "trade_accept_invite"; break;
+                case Sbywow::IntentKind::FaceTarget:             kindName = "face_target"; break;
+                case Sbywow::IntentKind::ComeBack:               kindName = "come_back"; break;
             }
             out.push_back(IntentView{ p->intentId, p->verb, kindName });
         }
