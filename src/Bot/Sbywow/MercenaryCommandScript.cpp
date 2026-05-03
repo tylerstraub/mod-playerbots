@@ -170,7 +170,7 @@ public:
         if (arg.empty())
         {
             handler->SendSysMessage("Usage: .merc hire [faction] <class> [name]");
-            handler->SendSysMessage("  faction (optional): same | opposite | alliance | horde | any  (default: any)");
+            handler->SendSysMessage("  faction (optional): same | opposite | alliance | horde | any  (default: same)");
             handler->SendSysMessage("  class:              warrior|paladin|hunter|rogue|priest|dk|shaman|mage|warlock|druid");
             return true;
         }
@@ -204,7 +204,13 @@ public:
             pos = next + 1;
         }
 
-        FactionRequirement factionReq = FactionRequirement::Any;
+        // Default is same-faction: opposite-faction mercs get killed by
+        // city guards on sight, breaking every vendor / mailbox / gossip
+        // errand. Pass `any` / `opposite` / `alliance` / `horde`
+        // explicitly to override.
+        FactionRequirement factionReq = (player->GetTeamId() == TEAM_ALLIANCE)
+            ? FactionRequirement::Alliance
+            : FactionRequirement::Horde;
         std::size_t classIdx = 0;
         if (!tokens.empty() && IsFactionArg(tokens[0]))
         {
