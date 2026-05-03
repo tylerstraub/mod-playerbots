@@ -649,6 +649,7 @@ namespace Sbywow::Bridge
             {"power_max",  power["power_max"]},
             {"power_pct",  power["power_pct"]},
             {"position",   {bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()}},
+            {"facing",     bot->GetOrientation()},
             {"map",        bot->GetMapId()},
             {"zone",       bot->GetZoneId()},
             {"area",       bot->GetAreaId()},
@@ -660,6 +661,7 @@ namespace Sbywow::Bridge
             {"rest_bonus", bot->GetRestBonus()},
             {"xp",         xpCur},
             {"xp_next",    xpNext},
+            {"guid",       bot->GetGUID().GetRawValue()},
             {"target",     BuildTargetBlock(bot)},
             {"auras",      BuildAurasBlock(bot)},
             {"cooldowns",  BuildCooldownsBlock(bot)}
@@ -676,6 +678,7 @@ namespace Sbywow::Bridge
 
             masterJson = {
                 {"name",       master->GetName()},
+                {"guid",       master->GetGUID().GetRawValue()},
                 {"level",      master->GetLevel()},
                 {"class_id",   static_cast<int>(master->getClass())},
                 {"race_id",    static_cast<int>(master->getRace())},
@@ -685,6 +688,7 @@ namespace Sbywow::Bridge
                 {"power_type", mpower["power_type"]},
                 {"power_pct",  mpower["power_pct"]},
                 {"position",   {master->GetPositionX(), master->GetPositionY(), master->GetPositionZ()}},
+                {"facing",     master->GetOrientation()},
                 {"map",        master->GetMapId()},
                 {"zone",       master->GetZoneId()},
                 {"area",       master->GetAreaId()},
@@ -729,10 +733,18 @@ namespace Sbywow::Bridge
             // (once in the consumables rollup, once in `other`) and the
             // agent double-counts. A consumable's specific entry/name is
             // available in consumables.<bucket>.items.
+            // Per-entry aggregates carry the first item_guid we saw,
+            // letting the agent issue per-item verbs (sell/destroy/
+            // equip/trade_offer) without a separate lookup. Multiple
+            // physical stacks of the same entry collapse into one
+            // record; the surfaced guid points at the head stack and
+            // the entry-fallback pattern in those verbs picks any
+            // matching item server-side anyway.
             struct Stack
             {
-                ItemTemplate const* tpl   = nullptr;
-                uint32              count = 0;
+                ItemTemplate const* tpl       = nullptr;
+                uint32              count     = 0;
+                uint64_t            firstGuid = 0;
             };
             std::map<uint32, Stack>            stacked;
 
@@ -740,8 +752,9 @@ namespace Sbywow::Bridge
             // by entry across multiple stacks of the same item.
             struct ConsumableEntry
             {
-                ItemTemplate const* tpl   = nullptr;
-                uint32              count = 0;
+                ItemTemplate const* tpl       = nullptr;
+                uint32              count     = 0;
+                uint64_t            firstGuid = 0;
             };
             std::map<std::string, std::map<uint32, ConsumableEntry>> consumablesByBucket;
             std::map<std::string, uint32>                            consumableTotals;
@@ -750,11 +763,13 @@ namespace Sbywow::Bridge
                 ItemTemplate const* tpl = it->GetTemplate();
                 if (!tpl) return;
                 uint32 cnt = it->GetCount();
+                uint64_t guid = it->GetGUID().GetRawValue();
                 if (char const* bucket = ConsumableBucket(tpl))
                 {
                     auto& ce = consumablesByBucket[bucket][tpl->ItemId];
                     ce.tpl    = tpl;
                     ce.count += cnt;
+                    if (ce.firstGuid == 0) ce.firstGuid = guid;
                     consumableTotals[bucket] += cnt;
                 }
                 else
@@ -762,6 +777,7 @@ namespace Sbywow::Bridge
                     auto& s = stacked[tpl->ItemId];
                     s.tpl    = tpl;
                     s.count += cnt;
+                    if (s.firstGuid == 0) s.firstGuid = guid;
                 }
             });
 
@@ -779,10 +795,11 @@ namespace Sbywow::Bridge
             {
                 ItemTemplate const* tpl = st.tpl;
                 json one = {
-                    {"entry",   tpl->ItemId},
-                    {"name",    tpl->Name1},
-                    {"count",   st.count},
-                    {"quality", QualityName(tpl->Quality)}
+                    {"entry",     tpl->ItemId},
+                    {"name",      tpl->Name1},
+                    {"count",     st.count},
+                    {"quality",   QualityName(tpl->Quality)},
+                    {"item_guid", st.firstGuid}
                 };
                 bool isQuest   = (tpl->Class == ITEM_CLASS_QUEST) || tpl->StartQuest != 0;
                 bool isNotable = tpl->Quality >= ITEM_QUALITY_RARE;
@@ -806,10 +823,11 @@ namespace Sbywow::Bridge
             {
                 ItemTemplate const* tpl = st->tpl;
                 other.push_back({
-                    {"entry",   tpl->ItemId},
-                    {"name",    tpl->Name1},
-                    {"count",   st->count},
-                    {"quality", QualityName(tpl->Quality)}
+                    {"entry",     tpl->ItemId},
+                    {"name",      tpl->Name1},
+                    {"count",     st->count},
+                    {"quality",   QualityName(tpl->Quality)},
+                    {"item_guid", st->firstGuid}
                 });
             }
 
@@ -862,9 +880,10 @@ namespace Sbywow::Bridge
                     for (auto const& [entry, ce] : bit->second)
                     {
                         items.push_back({
-                            {"entry", ce.tpl->ItemId},
-                            {"name",  ce.tpl->Name1},
-                            {"count", ce.count}
+                            {"entry",     ce.tpl->ItemId},
+                            {"name",      ce.tpl->Name1},
+                            {"count",     ce.count},
+                            {"item_guid", ce.firstGuid}
                         });
                     }
                 }
@@ -1006,9 +1025,33 @@ namespace Sbywow::Bridge
             ticksTotal     = agentEng->TicksTotal();
             reactivesTotal = agentEng->ReactivesFiredTotal();
         }
+        // engine_state — what the agent's tick is doing right now.
+        // Mirrors the routing tree at the top of
+        // SbywowAgentEngine::DoNextAction: agent_mode off, in-combat
+        // delegation, wait suspension, in-flight blocking slot, idle
+        // follow delegation, anchored idle, or actively dispatching
+        // from the queue. Lets the agent reason about "why aren't my
+        // intents draining" without reading combat / mode / queue
+        // separately and inferring.
+        char const* engineState = "agent";
+        if (!sess.IsAgentMode())
+            engineState = "delegated_default_off";
+        else if (bot->IsInCombat())
+            engineState = "delegated_combat";
+        else if (agentEng && agentEng->IsWaiting())
+            engineState = "waiting";
+        else if (agentEng && (agentEng->IsMoving() || agentEng->IsCasting()))
+            engineState = "in_flight";
+        else if (sess.PeekIntent())
+            engineState = "agent";
+        else if (sess.IsFollowMode())
+            engineState = "delegated_idle_follow";
+        else
+            engineState = "idle_anchored";
         json session = {
             {"agent_mode",               sess.IsAgentMode()},
             {"follow_mode",              sess.IsFollowMode()},
+            {"engine_state",             engineState},
             {"uptime_ms",                sess.UptimeMs()},
             {"heartbeat_ms",             sess.HeartbeatAgeMs()},
             {"sse_attached",             sess.IsSseAttached()},
@@ -1631,6 +1674,34 @@ namespace Sbywow::Bridge
             return Defer(bot, sess, cmd, "group_ready_check_respond", std::move(i));
         }
 
+        // ---- Debug / test helper: reset_cooldowns -----------------------
+        //
+        // Wipes spell cooldowns on the bot — pass `spell_id` for a single
+        // spell, omit for all. Lets the test runner re-exercise
+        // long-cooldown spells (Hearthstone, mounts, etc) without
+        // waiting out the natural CD or restarting the server. Sync
+        // verb, no intent queue. Bridge auth (GM-only by default)
+        // gates abuse.
+        std::string DoResetCooldowns(Player* bot, json const& req)
+        {
+            if (req.contains("spell_id") && req["spell_id"].is_number_unsigned())
+            {
+                uint32_t spellId = req["spell_id"].get<uint32_t>();
+                bot->RemoveSpellCooldown(spellId, /*update=*/ true);
+                return json{
+                    {"ok",       true},
+                    {"verb",     "reset_cooldowns"},
+                    {"spell_id", spellId}
+                }.dump();
+            }
+            bot->RemoveAllSpellCooldown();
+            return json{
+                {"ok",   true},
+                {"verb", "reset_cooldowns"},
+                {"all",  true}
+            }.dump();
+        }
+
         // ---- Sync deep-discovery: vendor_inventory ----------------------
         //
         // Pure read of Creature::GetVendorItems with item template
@@ -2194,6 +2265,7 @@ namespace Sbywow::Bridge
             // ---- Phase 4 / 5 — vendor / trade / gossip / inventory /
             //       world / mail / quest / group verbs ------------------
             if (verb == "vendor_inventory")           return DoVendorInventory(bot, req);
+            if (verb == "reset_cooldowns")            return DoResetCooldowns(bot, req);
             if (verb == "buy_item")                   return QueueBuyItemIntent(bot, sess, cmd, req);
             if (verb == "sell_item")                  return QueueSellItemIntent(bot, sess, cmd, req);
             if (verb == "select_gossip_option")       return QueueSelectGossipOptionIntent(bot, sess, cmd, req);
