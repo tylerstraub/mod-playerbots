@@ -1257,6 +1257,405 @@ namespace Sbywow::Bridge
             return Defer(bot, sess, cmd, "wait", std::move(i));
         }
 
+        // ---- Phase 4 / 5 — intent verb dispatchers ----------------------
+        //
+        // Each builds an Intent of the appropriate kind, validates required
+        // fields, and Defers (returns intent_id ack; engine completes
+        // async via SSE). Engine-side executors are in
+        // SbywowAgentEngine.cpp; verbs whose executor is still stubbed
+        // will return {ok:false, error:"not yet implemented"} via the
+        // intent_failed SSE event.
+
+        std::string QueueBuyItemIntent(Player* bot, BotSession& sess,
+                                       std::shared_ptr<PendingCommand>& cmd,
+                                       json const& req)
+        {
+            if (!req.contains("vendor_guid") || !req["vendor_guid"].is_number())
+                return json{{"ok", false}, {"error", "buy_item requires vendor_guid"}}.dump();
+            if (!req.contains("item_entry") || !req["item_entry"].is_number())
+                return json{{"ok", false}, {"error", "buy_item requires item_entry"}}.dump();
+            Sbywow::Intent i;
+            i.kind        = Sbywow::IntentKind::BuyItem;
+            i.vendorGuid  = req["vendor_guid"].get<uint64_t>();
+            i.itemEntry   = req["item_entry"].get<uint32_t>();
+            i.quantity    = req.contains("count") && req["count"].is_number_unsigned()
+                            ? req["count"].get<uint32_t>() : 1;
+            return Defer(bot, sess, cmd, "buy_item", std::move(i));
+        }
+
+        std::string QueueSellItemIntent(Player* bot, BotSession& sess,
+                                        std::shared_ptr<PendingCommand>& cmd,
+                                        json const& req)
+        {
+            if (!req.contains("vendor_guid") || !req["vendor_guid"].is_number())
+                return json{{"ok", false}, {"error", "sell_item requires vendor_guid"}}.dump();
+            if (!req.contains("item_guid") || !req["item_guid"].is_number())
+                return json{{"ok", false}, {"error", "sell_item requires item_guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind       = Sbywow::IntentKind::SellItem;
+            i.vendorGuid = req["vendor_guid"].get<uint64_t>();
+            i.itemGuid   = req["item_guid"].get<uint64_t>();
+            i.quantity   = req.contains("count") && req["count"].is_number_unsigned()
+                           ? req["count"].get<uint32_t>() : 0;  // 0 = sell whole stack
+            return Defer(bot, sess, cmd, "sell_item", std::move(i));
+        }
+
+        std::string QueueSelectGossipOptionIntent(Player* bot, BotSession& sess,
+                                                  std::shared_ptr<PendingCommand>& cmd,
+                                                  json const& req)
+        {
+            if (!req.contains("option_index") || !req["option_index"].is_number())
+                return json{{"ok", false}, {"error", "select_gossip_option requires option_index"}}.dump();
+            Sbywow::Intent i;
+            i.kind     = Sbywow::IntentKind::SelectGossipOption;
+            i.intParam = req["option_index"].get<int32_t>();
+            return Defer(bot, sess, cmd, "select_gossip_option", std::move(i));
+        }
+
+        std::string QueueTradeInitiateIntent(Player* bot, BotSession& sess,
+                                             std::shared_ptr<PendingCommand>& cmd,
+                                             json const& req)
+        {
+            if (!req.contains("partner_guid") || !req["partner_guid"].is_number())
+                return json{{"ok", false}, {"error", "trade_initiate requires partner_guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::TradeInitiate;
+            i.guid = req["partner_guid"].get<uint64_t>();
+            return Defer(bot, sess, cmd, "trade_initiate", std::move(i));
+        }
+
+        std::string QueueTradeOfferItemIntent(Player* bot, BotSession& sess,
+                                              std::shared_ptr<PendingCommand>& cmd,
+                                              json const& req)
+        {
+            if (!req.contains("trade_slot") || !req["trade_slot"].is_number())
+                return json{{"ok", false}, {"error", "trade_offer_item requires trade_slot"}}.dump();
+            if (!req.contains("item_guid") || !req["item_guid"].is_number())
+                return json{{"ok", false}, {"error", "trade_offer_item requires item_guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind     = Sbywow::IntentKind::TradeOfferItem;
+            i.intParam = req["trade_slot"].get<int32_t>();
+            i.itemGuid = req["item_guid"].get<uint64_t>();
+            return Defer(bot, sess, cmd, "trade_offer_item", std::move(i));
+        }
+
+        std::string QueueTradeOfferMoneyIntent(Player* bot, BotSession& sess,
+                                               std::shared_ptr<PendingCommand>& cmd,
+                                               json const& req)
+        {
+            if (!req.contains("copper") || !req["copper"].is_number_unsigned())
+                return json{{"ok", false}, {"error", "trade_offer_money requires copper"}}.dump();
+            Sbywow::Intent i;
+            i.kind   = Sbywow::IntentKind::TradeOfferMoney;
+            i.copper = req["copper"].get<uint32_t>();
+            return Defer(bot, sess, cmd, "trade_offer_money", std::move(i));
+        }
+
+        std::string QueueTradeAcceptIntent(Player* bot, BotSession& sess,
+                                           std::shared_ptr<PendingCommand>& cmd,
+                                           json const& /*req*/)
+        {
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::TradeAccept;
+            return Defer(bot, sess, cmd, "trade_accept", std::move(i));
+        }
+
+        std::string QueueTradeCancelIntent(Player* bot, BotSession& sess,
+                                           std::shared_ptr<PendingCommand>& cmd,
+                                           json const& /*req*/)
+        {
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::TradeCancel;
+            return Defer(bot, sess, cmd, "trade_cancel", std::move(i));
+        }
+
+        std::string QueueEquipItemIntent(Player* bot, BotSession& sess,
+                                         std::shared_ptr<PendingCommand>& cmd,
+                                         json const& req)
+        {
+            if (!req.contains("item_guid") || !req["item_guid"].is_number())
+                return json{{"ok", false}, {"error", "equip_item requires item_guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind     = Sbywow::IntentKind::EquipItem;
+            i.itemGuid = req["item_guid"].get<uint64_t>();
+            // optional dest slot — when -1, engine auto-finds suitable slot
+            i.intParam = req.contains("dest_slot") && req["dest_slot"].is_number()
+                         ? req["dest_slot"].get<int32_t>() : -1;
+            return Defer(bot, sess, cmd, "equip_item", std::move(i));
+        }
+
+        std::string QueueUnequipItemIntent(Player* bot, BotSession& sess,
+                                           std::shared_ptr<PendingCommand>& cmd,
+                                           json const& req)
+        {
+            if (!req.contains("equip_slot") || !req["equip_slot"].is_number())
+                return json{{"ok", false}, {"error", "unequip_item requires equip_slot"}}.dump();
+            Sbywow::Intent i;
+            i.kind     = Sbywow::IntentKind::UnequipItem;
+            i.intParam = req["equip_slot"].get<int32_t>();
+            return Defer(bot, sess, cmd, "unequip_item", std::move(i));
+        }
+
+        std::string QueueDestroyItemIntent(Player* bot, BotSession& sess,
+                                           std::shared_ptr<PendingCommand>& cmd,
+                                           json const& req)
+        {
+            if (!req.contains("item_guid") || !req["item_guid"].is_number())
+                return json{{"ok", false}, {"error", "destroy_item requires item_guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind     = Sbywow::IntentKind::DestroyItem;
+            i.itemGuid = req["item_guid"].get<uint64_t>();
+            i.quantity = req.contains("count") && req["count"].is_number_unsigned()
+                         ? req["count"].get<uint32_t>() : 0;  // 0 = destroy whole stack
+            return Defer(bot, sess, cmd, "destroy_item", std::move(i));
+        }
+
+        std::string QueueUseItemIntent(Player* bot, BotSession& sess,
+                                       std::shared_ptr<PendingCommand>& cmd,
+                                       json const& req)
+        {
+            if (!req.contains("item_guid") || !req["item_guid"].is_number())
+                return json{{"ok", false}, {"error", "use_item requires item_guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind     = Sbywow::IntentKind::UseItem;
+            i.itemGuid = req["item_guid"].get<uint64_t>();
+            i.guid     = req.contains("target_guid") && req["target_guid"].is_number()
+                         ? req["target_guid"].get<uint64_t>() : 0;
+            return Defer(bot, sess, cmd, "use_item", std::move(i));
+        }
+
+        std::string QueueCastSpellIntent(Player* bot, BotSession& sess,
+                                         std::shared_ptr<PendingCommand>& cmd,
+                                         json const& req)
+        {
+            if (!req.contains("spell_id") || !req["spell_id"].is_number_unsigned())
+                return json{{"ok", false}, {"error", "cast_spell requires spell_id"}}.dump();
+            Sbywow::Intent i;
+            i.kind    = Sbywow::IntentKind::CastSpell;
+            i.spellId = req["spell_id"].get<uint32_t>();
+            i.guid    = req.contains("target_guid") && req["target_guid"].is_number()
+                        ? req["target_guid"].get<uint64_t>() : 0;
+            return Defer(bot, sess, cmd, "cast_spell", std::move(i));
+        }
+
+        std::string QueueMountIntent(Player* bot, BotSession& sess,
+                                     std::shared_ptr<PendingCommand>& cmd,
+                                     json const& req)
+        {
+            Sbywow::Intent i;
+            i.kind    = Sbywow::IntentKind::Mount;
+            // Optional: spell_id picks a specific mount; absent means "any
+            // available." Engine-side picks from spellbook.
+            i.spellId = req.contains("spell_id") && req["spell_id"].is_number_unsigned()
+                        ? req["spell_id"].get<uint32_t>() : 0;
+            return Defer(bot, sess, cmd, "mount", std::move(i));
+        }
+
+        std::string QueueDismountIntent(Player* bot, BotSession& sess,
+                                        std::shared_ptr<PendingCommand>& cmd,
+                                        json const& /*req*/)
+        {
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::Dismount;
+            return Defer(bot, sess, cmd, "dismount", std::move(i));
+        }
+
+        std::string QueueInteractGameObjectIntent(Player* bot, BotSession& sess,
+                                                  std::shared_ptr<PendingCommand>& cmd,
+                                                  json const& req)
+        {
+            if (!req.contains("guid") || !req["guid"].is_number())
+                return json{{"ok", false}, {"error", "interact_gameobject requires guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::InteractGameObject;
+            i.guid = req["guid"].get<uint64_t>();
+            return Defer(bot, sess, cmd, "interact_gameobject", std::move(i));
+        }
+
+        std::string QueueLootTargetIntent(Player* bot, BotSession& sess,
+                                          std::shared_ptr<PendingCommand>& cmd,
+                                          json const& req)
+        {
+            if (!req.contains("guid") || !req["guid"].is_number())
+                return json{{"ok", false}, {"error", "loot_target requires guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::LootTarget;
+            i.guid = req["guid"].get<uint64_t>();
+            return Defer(bot, sess, cmd, "loot_target", std::move(i));
+        }
+
+        std::string QueueMailSendIntent(Player* bot, BotSession& sess,
+                                        std::shared_ptr<PendingCommand>& cmd,
+                                        json const& req)
+        {
+            std::string recipient = req.value("recipient", "");
+            if (recipient.empty())
+                return json{{"ok", false}, {"error", "mail_send requires recipient"}}.dump();
+            Sbywow::Intent i;
+            i.kind      = Sbywow::IntentKind::MailSend;
+            i.strParam1 = std::move(recipient);
+            i.strParam2 = req.value("subject", "");
+            i.strParam3 = req.value("body",    "");
+            i.itemGuid  = req.contains("item_guid") && req["item_guid"].is_number()
+                          ? req["item_guid"].get<uint64_t>() : 0;
+            i.copper    = req.contains("copper") && req["copper"].is_number_unsigned()
+                          ? req["copper"].get<uint32_t>() : 0;
+            return Defer(bot, sess, cmd, "mail_send", std::move(i));
+        }
+
+        std::string QueueMailTakeItemIntent(Player* bot, BotSession& sess,
+                                            std::shared_ptr<PendingCommand>& cmd,
+                                            json const& req)
+        {
+            if (!req.contains("mail_id") || !req["mail_id"].is_number())
+                return json{{"ok", false}, {"error", "mail_take_item requires mail_id"}}.dump();
+            if (!req.contains("item_guid") || !req["item_guid"].is_number())
+                return json{{"ok", false}, {"error", "mail_take_item requires item_guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind     = Sbywow::IntentKind::MailTakeItem;
+            i.mailId   = req["mail_id"].get<uint64_t>();
+            i.itemGuid = req["item_guid"].get<uint64_t>();
+            return Defer(bot, sess, cmd, "mail_take_item", std::move(i));
+        }
+
+        std::string QueueMailTakeMoneyIntent(Player* bot, BotSession& sess,
+                                             std::shared_ptr<PendingCommand>& cmd,
+                                             json const& req)
+        {
+            if (!req.contains("mail_id") || !req["mail_id"].is_number())
+                return json{{"ok", false}, {"error", "mail_take_money requires mail_id"}}.dump();
+            Sbywow::Intent i;
+            i.kind   = Sbywow::IntentKind::MailTakeMoney;
+            i.mailId = req["mail_id"].get<uint64_t>();
+            return Defer(bot, sess, cmd, "mail_take_money", std::move(i));
+        }
+
+        std::string QueueQuestVerbIntent(Player* bot, BotSession& sess,
+                                         std::shared_ptr<PendingCommand>& cmd,
+                                         json const& req,
+                                         Sbywow::IntentKind kind, char const* verb)
+        {
+            if (!req.contains("quest_id") || !req["quest_id"].is_number_unsigned())
+                return json{{"ok", false}, {"error",
+                            std::string(verb) + " requires quest_id"}}.dump();
+            Sbywow::Intent i;
+            i.kind    = kind;
+            i.questId = req["quest_id"].get<uint32_t>();
+            // accept/complete need the questgiver guid; abandon/share don't
+            i.guid    = req.contains("npc_guid") && req["npc_guid"].is_number()
+                        ? req["npc_guid"].get<uint64_t>() : 0;
+            return Defer(bot, sess, cmd, verb, std::move(i));
+        }
+
+        std::string QueueGroupSimpleIntent(Player* bot, BotSession& sess,
+                                           std::shared_ptr<PendingCommand>& cmd,
+                                           Sbywow::IntentKind kind, char const* verb)
+        {
+            Sbywow::Intent i;
+            i.kind = kind;
+            return Defer(bot, sess, cmd, verb, std::move(i));
+        }
+
+        std::string QueueGroupPromoteLeaderIntent(Player* bot, BotSession& sess,
+                                                  std::shared_ptr<PendingCommand>& cmd,
+                                                  json const& req)
+        {
+            if (!req.contains("target_guid") || !req["target_guid"].is_number())
+                return json{{"ok", false}, {"error", "group_promote_leader requires target_guid"}}.dump();
+            Sbywow::Intent i;
+            i.kind = Sbywow::IntentKind::GroupPromoteLeader;
+            i.guid = req["target_guid"].get<uint64_t>();
+            return Defer(bot, sess, cmd, "group_promote_leader", std::move(i));
+        }
+
+        std::string QueueGroupReadyCheckRespondIntent(Player* bot, BotSession& sess,
+                                                      std::shared_ptr<PendingCommand>& cmd,
+                                                      json const& req)
+        {
+            // 1 = ready, 0 = not ready
+            int32_t v = 1;
+            if (req.contains("ready") && req["ready"].is_boolean())
+                v = req["ready"].get<bool>() ? 1 : 0;
+            Sbywow::Intent i;
+            i.kind     = Sbywow::IntentKind::GroupReadyCheckRespond;
+            i.intParam = v;
+            return Defer(bot, sess, cmd, "group_ready_check_respond", std::move(i));
+        }
+
+        // ---- Sync deep-discovery: vendor_inventory ----------------------
+        //
+        // Pure read of Creature::GetVendorItems with item template
+        // expansion. No packets sent — agent reads catalog without
+        // affecting bot state. Range-gated to mirror real proximity.
+        std::string DoVendorInventory(Player* bot, json const& req)
+        {
+            if (!req.contains("vendor_guid") || !req["vendor_guid"].is_number())
+                return json{{"ok", false}, {"error", "vendor_inventory requires vendor_guid"}}.dump();
+            ObjectGuid vGuid(req["vendor_guid"].get<uint64_t>());
+
+            Creature* npc = ObjectAccessor::GetCreature(*bot, vGuid);
+            if (!npc)
+                return json{{"ok", false}, {"error", "vendor not found on bot's map"}}.dump();
+            if (!npc->IsVendor())
+                return json{
+                    {"ok", false},
+                    {"error", "creature is not a vendor"},
+                    {"name", npc->GetName()}
+                }.dump();
+            float dist = bot->GetExactDist(npc);
+            constexpr float kMaxRange = 12.0f;  // matches AC's INTERACTION_DISTANCE roughly
+            if (dist > kMaxRange)
+                return json{
+                    {"ok",       false},
+                    {"error",    "vendor out of range"},
+                    {"name",     npc->GetName()},
+                    {"distance", dist},
+                    {"max_range", kMaxRange}
+                }.dump();
+
+            VendorItemData const* vItems = npc->GetVendorItems();
+            if (!vItems || vItems->Empty())
+                return json{
+                    {"ok",      true},
+                    {"verb",    "vendor_inventory"},
+                    {"name",    npc->GetName()},
+                    {"items",   json::array()},
+                    {"empty",   true}
+                }.dump();
+
+            json items = json::array();
+            for (uint32 i = 0; i < vItems->GetItemCount(); ++i)
+            {
+                VendorItem const* vi = vItems->GetItem(i);
+                if (!vi) continue;
+                ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(vi->item);
+                if (!tpl) continue;
+                items.push_back({
+                    {"slot",            i},
+                    {"entry",           vi->item},
+                    {"name",            tpl->Name1},
+                    {"buy_price",       tpl->BuyPrice},
+                    {"sell_price",      tpl->SellPrice},
+                    {"required_level",  tpl->RequiredLevel},
+                    {"max_stack",       tpl->Stackable},
+                    {"stock_max",       vi->maxcount},        // 0 = infinite
+                    {"extended_cost",   vi->ExtendedCost},
+                    {"quality",         static_cast<int>(tpl->Quality)},
+                    {"item_class",      static_cast<int>(tpl->Class)},
+                    {"item_subclass",   static_cast<int>(tpl->SubClass)}
+                });
+            }
+
+            return json{
+                {"ok",       true},
+                {"verb",     "vendor_inventory"},
+                {"name",     npc->GetName()},
+                {"distance", dist},
+                {"count",    items.size()},
+                {"items",    items}
+            }.dump();
+        }
+
 
         // Decode a creature's npc_flags field into a small array of
         // human-readable role tags. The agent uses these to pick which
@@ -1742,6 +2141,39 @@ namespace Sbywow::Bridge
             // harness needing to time-out HTTP round-trips.
             if (verb == "wait")
                 return QueueWaitIntent(bot, sess, cmd, req);
+
+            // ---- Phase 4 / 5 — vendor / trade / gossip / inventory /
+            //       world / mail / quest / group verbs ------------------
+            if (verb == "vendor_inventory")           return DoVendorInventory(bot, req);
+            if (verb == "buy_item")                   return QueueBuyItemIntent(bot, sess, cmd, req);
+            if (verb == "sell_item")                  return QueueSellItemIntent(bot, sess, cmd, req);
+            if (verb == "select_gossip_option")       return QueueSelectGossipOptionIntent(bot, sess, cmd, req);
+            if (verb == "trade_initiate")             return QueueTradeInitiateIntent(bot, sess, cmd, req);
+            if (verb == "trade_offer_item")           return QueueTradeOfferItemIntent(bot, sess, cmd, req);
+            if (verb == "trade_offer_money")          return QueueTradeOfferMoneyIntent(bot, sess, cmd, req);
+            if (verb == "trade_accept")               return QueueTradeAcceptIntent(bot, sess, cmd, req);
+            if (verb == "trade_cancel")               return QueueTradeCancelIntent(bot, sess, cmd, req);
+            if (verb == "equip_item")                 return QueueEquipItemIntent(bot, sess, cmd, req);
+            if (verb == "unequip_item")               return QueueUnequipItemIntent(bot, sess, cmd, req);
+            if (verb == "destroy_item")               return QueueDestroyItemIntent(bot, sess, cmd, req);
+            if (verb == "use_item")                   return QueueUseItemIntent(bot, sess, cmd, req);
+            if (verb == "cast_spell")                 return QueueCastSpellIntent(bot, sess, cmd, req);
+            if (verb == "mount")                      return QueueMountIntent(bot, sess, cmd, req);
+            if (verb == "dismount")                   return QueueDismountIntent(bot, sess, cmd, req);
+            if (verb == "interact_gameobject")        return QueueInteractGameObjectIntent(bot, sess, cmd, req);
+            if (verb == "loot_target")                return QueueLootTargetIntent(bot, sess, cmd, req);
+            if (verb == "mail_send")                  return QueueMailSendIntent(bot, sess, cmd, req);
+            if (verb == "mail_take_item")             return QueueMailTakeItemIntent(bot, sess, cmd, req);
+            if (verb == "mail_take_money")            return QueueMailTakeMoneyIntent(bot, sess, cmd, req);
+            if (verb == "quest_accept")               return QueueQuestVerbIntent(bot, sess, cmd, req, Sbywow::IntentKind::QuestAccept,   "quest_accept");
+            if (verb == "quest_complete")             return QueueQuestVerbIntent(bot, sess, cmd, req, Sbywow::IntentKind::QuestComplete, "quest_complete");
+            if (verb == "quest_abandon")              return QueueQuestVerbIntent(bot, sess, cmd, req, Sbywow::IntentKind::QuestAbandon,  "quest_abandon");
+            if (verb == "quest_share")                return QueueQuestVerbIntent(bot, sess, cmd, req, Sbywow::IntentKind::QuestShare,    "quest_share");
+            if (verb == "group_accept_invite")        return QueueGroupSimpleIntent(bot, sess, cmd, Sbywow::IntentKind::GroupAcceptInvite,  "group_accept_invite");
+            if (verb == "group_decline_invite")       return QueueGroupSimpleIntent(bot, sess, cmd, Sbywow::IntentKind::GroupDeclineInvite, "group_decline_invite");
+            if (verb == "group_leave")                return QueueGroupSimpleIntent(bot, sess, cmd, Sbywow::IntentKind::GroupLeave,         "group_leave");
+            if (verb == "group_promote_leader")       return QueueGroupPromoteLeaderIntent(bot, sess, cmd, req);
+            if (verb == "group_ready_check_respond")  return QueueGroupReadyCheckRespondIntent(bot, sess, cmd, req);
 
             // cancel_intent removes a queued intent or interrupts an
             // in-flight Wait. Sub-tick intents (Move/Interact/Say/

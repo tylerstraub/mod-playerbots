@@ -5,12 +5,18 @@
 #include "../Bridge/deps/json.hpp"
 
 #include "AiFactory.h"
+#include "Bag.h"
 #include "Creature.h"
+#include "CreatureData.h"
 #include "Event.h"
 #include "GossipDef.h"
+#include "Item.h"
+#include "ItemTemplate.h"
+#include "ItemPackets.h"
 #include "Log.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "Playerbots.h"
 #include "PlayerbotAI.h"
@@ -432,14 +438,43 @@ namespace Sbywow
     {
         switch (intent.kind)
         {
-            case IntentKind::Move:     return ExecuteMove    (bot, intent);
-            case IntentKind::Interact: return ExecuteInteract(bot, intent);
-            case IntentKind::Say:      return ExecuteSay     (bot, intent);
-            case IntentKind::DoAction: return ExecuteDoAction(bot, intent);
+            case IntentKind::Move:                   return ExecuteMove    (bot, intent);
+            case IntentKind::Interact:               return ExecuteInteract(bot, intent);
+            case IntentKind::Say:                    return ExecuteSay     (bot, intent);
+            case IntentKind::DoAction:               return ExecuteDoAction(bot, intent);
             case IntentKind::Wait:
                 // Wait is handled in DoNextAction directly (engine
                 // state); should never reach this dispatcher.
                 return json{{"ok", false}, {"error", "wait reached ExecuteIntent — bug"}}.dump();
+            case IntentKind::BuyItem:                return ExecuteBuyItem            (bot, intent);
+            case IntentKind::SellItem:               return ExecuteSellItem           (bot, intent);
+            case IntentKind::SelectGossipOption:     return ExecuteSelectGossipOption (bot, intent);
+            case IntentKind::TradeInitiate:          return ExecuteTradeInitiate      (bot, intent);
+            case IntentKind::TradeOfferItem:         return ExecuteTradeOfferItem     (bot, intent);
+            case IntentKind::TradeOfferMoney:        return ExecuteTradeOfferMoney    (bot, intent);
+            case IntentKind::TradeAccept:            return ExecuteTradeAccept        (bot, intent);
+            case IntentKind::TradeCancel:            return ExecuteTradeCancel        (bot, intent);
+            case IntentKind::EquipItem:              return ExecuteEquipItem          (bot, intent);
+            case IntentKind::UnequipItem:            return ExecuteUnequipItem        (bot, intent);
+            case IntentKind::DestroyItem:            return ExecuteDestroyItem        (bot, intent);
+            case IntentKind::UseItem:                return ExecuteUseItem            (bot, intent);
+            case IntentKind::CastSpell:              return ExecuteCastSpell          (bot, intent);
+            case IntentKind::Mount:                  return ExecuteMount              (bot, intent);
+            case IntentKind::Dismount:               return ExecuteDismount           (bot, intent);
+            case IntentKind::InteractGameObject:     return ExecuteInteractGameObject (bot, intent);
+            case IntentKind::LootTarget:             return ExecuteLootTarget         (bot, intent);
+            case IntentKind::MailSend:               return ExecuteMailSend           (bot, intent);
+            case IntentKind::MailTakeItem:           return ExecuteMailTakeItem       (bot, intent);
+            case IntentKind::MailTakeMoney:          return ExecuteMailTakeMoney      (bot, intent);
+            case IntentKind::QuestAccept:            return ExecuteQuestAccept        (bot, intent);
+            case IntentKind::QuestComplete:          return ExecuteQuestComplete      (bot, intent);
+            case IntentKind::QuestAbandon:           return ExecuteQuestAbandon       (bot, intent);
+            case IntentKind::QuestShare:             return ExecuteQuestShare         (bot, intent);
+            case IntentKind::GroupAcceptInvite:      return ExecuteGroupAcceptInvite  (bot, intent);
+            case IntentKind::GroupDeclineInvite:     return ExecuteGroupDeclineInvite (bot, intent);
+            case IntentKind::GroupLeave:             return ExecuteGroupLeave         (bot, intent);
+            case IntentKind::GroupPromoteLeader:     return ExecuteGroupPromoteLeader (bot, intent);
+            case IntentKind::GroupReadyCheckRespond: return ExecuteGroupReadyCheckRespond(bot, intent);
         }
         return json{{"ok", false}, {"error", "unknown intent kind"}}.dump();
     }
@@ -655,6 +690,157 @@ namespace Sbywow
             {"qualifier", intent.actionQualifier}
         }.dump();
     }
+
+    namespace
+    {
+        // Standard "verb not yet wired" stub. All Phase 4 / 5 batches
+        // declared their executors up front so the dispatch switch is
+        // complete; impls land batch-by-batch. Stubs return a clear
+        // error so the harness knows the verb is reserved but not
+        // active yet.
+        std::string NotImplemented(char const* verb)
+        {
+            return json{
+                {"ok",    false},
+                {"verb",  verb},
+                {"error", "not yet implemented (stub)"}
+            }.dump();
+        }
+    }
+
+    // ---- Phase 4: vendor verbs ----------------------------------------
+
+    std::string SbywowAgentEngine::ExecuteBuyItem(Player* bot, Intent const& intent)
+    {
+        if (!intent.vendorGuid || !intent.itemEntry)
+            return json{{"ok", false}, {"error", "buy_item requires vendor_guid and item_entry"}}.dump();
+
+        ObjectGuid vGuid(intent.vendorGuid);
+        Creature* npc = bot->GetNPCIfCanInteractWith(vGuid, UNIT_NPC_FLAG_VENDOR);
+        if (!npc)
+            return json{{"ok", false}, {"error", "vendor not found / out of range / not a vendor"}}.dump();
+
+        // Resolve item_entry → vendor slot. The agent reasons in
+        // entries; the buy API wants the slot index. Iterate the
+        // vendor's item list and match.
+        VendorItemData const* vItems = npc->GetVendorItems();
+        if (!vItems || vItems->Empty())
+            return json{{"ok", false}, {"error", "vendor has no items"}}.dump();
+
+        uint32 slot = 0;
+        bool found = false;
+        for (uint32 i = 0; i < vItems->GetItemCount(); ++i)
+        {
+            if (VendorItem const* vi = vItems->GetItem(i))
+            {
+                if (vi->item == intent.itemEntry)
+                {
+                    slot = i;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found)
+            return json{
+                {"ok", false},
+                {"error", "item_entry not in vendor catalog"},
+                {"item_entry", intent.itemEntry}
+            }.dump();
+
+        uint8 count = static_cast<uint8>(std::min<uint32>(intent.quantity ? intent.quantity : 1, 255u));
+        // bag/slot = NULL_BAG/NULL_SLOT means "auto-find a slot."
+        bool ok = bot->BuyItemFromVendorSlot(vGuid, slot, intent.itemEntry, count, NULL_BAG, NULL_SLOT);
+
+        return json{
+            {"ok",          ok},
+            {"verb",        "buy_item"},
+            {"vendor_guid", intent.vendorGuid},
+            {"vendor_name", npc->GetName()},
+            {"vendor_slot", slot},
+            {"item_entry",  intent.itemEntry},
+            {"count",       count}
+        }.dump();
+    }
+
+    std::string SbywowAgentEngine::ExecuteSellItem(Player* bot, Intent const& intent)
+    {
+        if (!intent.vendorGuid || !intent.itemGuid)
+            return json{{"ok", false}, {"error", "sell_item requires vendor_guid and item_guid"}}.dump();
+
+        // Construct + populate a SellItem packet, hand to the session.
+        // The handler does the validation (vendor proximity, item
+        // ownership, refundable check, etc.) and the gold transfer.
+        WorldPacket raw(CMSG_SELL_ITEM, 8 + 8 + 4);
+        WorldPackets::Item::SellItem packet(std::move(raw));
+        packet.VendorGuid = ObjectGuid(intent.vendorGuid);
+        packet.ItemGuid   = ObjectGuid(intent.itemGuid);
+        packet.Count      = intent.quantity;   // 0 = sell whole stack
+
+        // Capture pre-sell info for the response payload.
+        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        std::string itemName;
+        uint32      itemEntry = 0;
+        if (item)
+        {
+            if (ItemTemplate const* tpl = item->GetTemplate())
+            {
+                itemName  = tpl->Name1;
+                itemEntry = tpl->ItemId;
+            }
+        }
+        uint32 moneyBefore = bot->GetMoney();
+
+        bot->GetSession()->HandleSellItemOpcode(packet);
+
+        uint32 moneyAfter = bot->GetMoney();
+        Item* itemAfter = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        bool soldFully = (itemAfter == nullptr);
+
+        return json{
+            {"ok",            moneyAfter > moneyBefore || soldFully},
+            {"verb",          "sell_item"},
+            {"vendor_guid",   intent.vendorGuid},
+            {"item_guid",     intent.itemGuid},
+            {"item_entry",    itemEntry},
+            {"item_name",     itemName},
+            {"requested",     intent.quantity},
+            {"money_before",  moneyBefore},
+            {"money_after",   moneyAfter},
+            {"copper_gained", moneyAfter - moneyBefore},
+            {"sold_fully",    soldFully}
+        }.dump();
+    }
+
+    // ---- Phase 4 / 5 — stubs (impls land in their respective batches) -
+
+    std::string SbywowAgentEngine::ExecuteSelectGossipOption (Player*, Intent const&) { return NotImplemented("select_gossip_option"); }
+    std::string SbywowAgentEngine::ExecuteTradeInitiate      (Player*, Intent const&) { return NotImplemented("trade_initiate"); }
+    std::string SbywowAgentEngine::ExecuteTradeOfferItem     (Player*, Intent const&) { return NotImplemented("trade_offer_item"); }
+    std::string SbywowAgentEngine::ExecuteTradeOfferMoney    (Player*, Intent const&) { return NotImplemented("trade_offer_money"); }
+    std::string SbywowAgentEngine::ExecuteTradeAccept        (Player*, Intent const&) { return NotImplemented("trade_accept"); }
+    std::string SbywowAgentEngine::ExecuteTradeCancel        (Player*, Intent const&) { return NotImplemented("trade_cancel"); }
+    std::string SbywowAgentEngine::ExecuteEquipItem          (Player*, Intent const&) { return NotImplemented("equip_item"); }
+    std::string SbywowAgentEngine::ExecuteUnequipItem        (Player*, Intent const&) { return NotImplemented("unequip_item"); }
+    std::string SbywowAgentEngine::ExecuteDestroyItem        (Player*, Intent const&) { return NotImplemented("destroy_item"); }
+    std::string SbywowAgentEngine::ExecuteUseItem            (Player*, Intent const&) { return NotImplemented("use_item"); }
+    std::string SbywowAgentEngine::ExecuteCastSpell          (Player*, Intent const&) { return NotImplemented("cast_spell"); }
+    std::string SbywowAgentEngine::ExecuteMount              (Player*, Intent const&) { return NotImplemented("mount"); }
+    std::string SbywowAgentEngine::ExecuteDismount           (Player*, Intent const&) { return NotImplemented("dismount"); }
+    std::string SbywowAgentEngine::ExecuteInteractGameObject (Player*, Intent const&) { return NotImplemented("interact_gameobject"); }
+    std::string SbywowAgentEngine::ExecuteLootTarget         (Player*, Intent const&) { return NotImplemented("loot_target"); }
+    std::string SbywowAgentEngine::ExecuteMailSend           (Player*, Intent const&) { return NotImplemented("mail_send"); }
+    std::string SbywowAgentEngine::ExecuteMailTakeItem       (Player*, Intent const&) { return NotImplemented("mail_take_item"); }
+    std::string SbywowAgentEngine::ExecuteMailTakeMoney      (Player*, Intent const&) { return NotImplemented("mail_take_money"); }
+    std::string SbywowAgentEngine::ExecuteQuestAccept        (Player*, Intent const&) { return NotImplemented("quest_accept"); }
+    std::string SbywowAgentEngine::ExecuteQuestComplete      (Player*, Intent const&) { return NotImplemented("quest_complete"); }
+    std::string SbywowAgentEngine::ExecuteQuestAbandon       (Player*, Intent const&) { return NotImplemented("quest_abandon"); }
+    std::string SbywowAgentEngine::ExecuteQuestShare         (Player*, Intent const&) { return NotImplemented("quest_share"); }
+    std::string SbywowAgentEngine::ExecuteGroupAcceptInvite  (Player*, Intent const&) { return NotImplemented("group_accept_invite"); }
+    std::string SbywowAgentEngine::ExecuteGroupDeclineInvite (Player*, Intent const&) { return NotImplemented("group_decline_invite"); }
+    std::string SbywowAgentEngine::ExecuteGroupLeave         (Player*, Intent const&) { return NotImplemented("group_leave"); }
+    std::string SbywowAgentEngine::ExecuteGroupPromoteLeader (Player*, Intent const&) { return NotImplemented("group_promote_leader"); }
+    std::string SbywowAgentEngine::ExecuteGroupReadyCheckRespond(Player*, Intent const&) { return NotImplemented("group_ready_check_respond"); }
 
     bool SbywowAgentEngine::CancelWaitIfMatch(uint64_t intentId)
     {

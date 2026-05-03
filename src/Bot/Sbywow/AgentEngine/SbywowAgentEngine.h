@@ -131,6 +131,39 @@ namespace Sbywow
         // it doesn't run synchronously like the other intents; it
         // suspends queue draining for its duration.
 
+        // Phase 4 — vendor / gossip / trade / inventory / world.
+        std::string ExecuteBuyItem            (Player* bot, Intent const& intent);
+        std::string ExecuteSellItem           (Player* bot, Intent const& intent);
+        std::string ExecuteSelectGossipOption (Player* bot, Intent const& intent);
+        std::string ExecuteTradeInitiate      (Player* bot, Intent const& intent);
+        std::string ExecuteTradeOfferItem     (Player* bot, Intent const& intent);
+        std::string ExecuteTradeOfferMoney    (Player* bot, Intent const& intent);
+        std::string ExecuteTradeAccept        (Player* bot, Intent const& intent);
+        std::string ExecuteTradeCancel        (Player* bot, Intent const& intent);
+        std::string ExecuteEquipItem          (Player* bot, Intent const& intent);
+        std::string ExecuteUnequipItem        (Player* bot, Intent const& intent);
+        std::string ExecuteDestroyItem        (Player* bot, Intent const& intent);
+        std::string ExecuteUseItem            (Player* bot, Intent const& intent);
+        std::string ExecuteCastSpell          (Player* bot, Intent const& intent);
+        std::string ExecuteMount              (Player* bot, Intent const& intent);
+        std::string ExecuteDismount           (Player* bot, Intent const& intent);
+        std::string ExecuteInteractGameObject (Player* bot, Intent const& intent);
+        std::string ExecuteLootTarget         (Player* bot, Intent const& intent);
+
+        // Phase 5 — mail / quest / group.
+        std::string ExecuteMailSend           (Player* bot, Intent const& intent);
+        std::string ExecuteMailTakeItem       (Player* bot, Intent const& intent);
+        std::string ExecuteMailTakeMoney      (Player* bot, Intent const& intent);
+        std::string ExecuteQuestAccept        (Player* bot, Intent const& intent);
+        std::string ExecuteQuestComplete      (Player* bot, Intent const& intent);
+        std::string ExecuteQuestAbandon       (Player* bot, Intent const& intent);
+        std::string ExecuteQuestShare         (Player* bot, Intent const& intent);
+        std::string ExecuteGroupAcceptInvite  (Player* bot, Intent const& intent);
+        std::string ExecuteGroupDeclineInvite (Player* bot, Intent const& intent);
+        std::string ExecuteGroupLeave         (Player* bot, Intent const& intent);
+        std::string ExecuteGroupPromoteLeader (Player* bot, Intent const& intent);
+        std::string ExecuteGroupReadyCheckRespond(Player* bot, Intent const& intent);
+
         // Reactive autonomic: fire upstream "food"/"drink" actions
         // when the bot is idle (no queued intents, no wait active)
         // at low cadence. The actions self-gate via isUseful() so
