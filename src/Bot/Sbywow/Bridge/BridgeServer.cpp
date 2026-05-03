@@ -1,6 +1,7 @@
 #include "BridgeServer.h"
 
 #include "BotSession.h"
+#include "TradeEvents.h"
 
 #include "../AgentEngine/IsAgentBonded.h"
 #include "../AgentEngine/SbywowAgentEngine.h"
@@ -33,6 +34,7 @@
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "Timer.h"
+#include "TradeData.h"
 #include "Value.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
@@ -117,6 +119,11 @@ namespace Sbywow::Bridge
 
         server_ = std::make_unique<httplib::Server>();
         RegisterRoutes();
+
+        // Register fan-out emitters that need to be called from game-side
+        // splices (game can't reference module symbols at link time;
+        // see src/server/game/Sbywow/SbywowBridgeShim.h).
+        RegisterTradeEmitters();
 
         std::string host = config_.host;
         int         port = config_.port;
@@ -505,11 +512,55 @@ namespace Sbywow::Bridge
         }
 
         // Trade window snapshot. Returns null when no trade window is
-        // open. Wired in Batch 2 — reads bot->GetSession()->GetTradeData()
-        // for self/partner offers, accepted flags, partner identity.
-        json BuildTradeBlock(Player* /*bot*/)
+        // open. Reads bot->GetSession()->GetTradeData() for self/partner
+        // offers, accepted flags, partner identity. Cheap — at most 14
+        // item lookups (7 slots × 2 sides) when a window is open, zero
+        // when not.
+        json BuildTradeBlock(Player* bot)
         {
-            return nullptr;
+            if (!bot)
+                return nullptr;
+            TradeData* my = bot->GetTradeData();
+            if (!my)
+                return nullptr;
+            Player* partner = my->GetTrader();
+            TradeData* their = my->GetTraderData();
+
+            auto offerJson = [](TradeData const* td) -> json
+            {
+                json items = json::array();
+                if (!td)
+                    return json{{"items", items}, {"money", 0}, {"accepted", false}};
+                for (uint8 i = 0; i < TRADE_SLOT_COUNT; ++i)
+                {
+                    Item* it = td->GetItem(TradeSlots(i));
+                    if (!it)
+                        continue;
+                    ItemTemplate const* tpl = it->GetTemplate();
+                    if (!tpl)
+                        continue;
+                    items.push_back({
+                        {"trade_slot", static_cast<int>(i)},
+                        {"entry",      tpl->ItemId},
+                        {"name",       tpl->Name1},
+                        {"count",      it->GetCount()},
+                        {"item_guid",  it->GetGUID().GetRawValue()}
+                    });
+                }
+                return json{
+                    {"items",    items},
+                    {"money",    td->GetMoney()},
+                    {"accepted", td->IsAccepted()}
+                };
+            };
+
+            json out = {
+                {"partner_guid", partner ? partner->GetGUID().GetRawValue() : 0},
+                {"partner_name", partner ? partner->GetName() : std::string{}},
+                {"my_offer",     offerJson(my)},
+                {"their_offer",  offerJson(their)}
+            };
+            return out;
         }
 
         // Gossip menu snapshot. Returns null when no menu is open.
