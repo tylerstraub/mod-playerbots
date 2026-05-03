@@ -1022,8 +1022,28 @@ namespace Sbywow
 
     std::string SbywowAgentEngine::ExecuteSellItem(Player* bot, Intent const& intent)
     {
-        if (!intent.vendorGuid || !intent.itemGuid)
-            return json{{"ok", false}, {"error", "sell_item requires vendor_guid and item_guid"}}.dump();
+        if (!intent.vendorGuid)
+            return json{{"ok", false}, {"error", "sell_item requires vendor_guid"}}.dump();
+        if (!intent.itemGuid && !intent.itemEntry)
+            return json{{"ok", false}, {"error", "sell_item requires item_guid or item_entry"}}.dump();
+
+        // Resolve item_entry → guid (first matching item in bag) when
+        // the agent passed entry-only. Lets the caller reason about
+        // entries from snapshot without first looking up the specific
+        // physical item's guid.
+        Item* item = nullptr;
+        if (intent.itemGuid)
+            item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        else if (intent.itemEntry)
+            item = bot->GetItemByEntry(intent.itemEntry);
+        if (!item)
+            return json{
+                {"ok",         false},
+                {"error",      "item not in bot's bag"},
+                {"item_guid",  intent.itemGuid},
+                {"item_entry", intent.itemEntry}
+            }.dump();
+        uint64_t resolvedGuid = item->GetGUID().GetRawValue();
 
         // Construct + populate a SellItem packet, hand to the session.
         // The handler does the validation (vendor proximity, item
@@ -1031,34 +1051,30 @@ namespace Sbywow
         WorldPacket raw(CMSG_SELL_ITEM, 8 + 8 + 4);
         WorldPackets::Item::SellItem packet(std::move(raw));
         packet.VendorGuid = ObjectGuid(intent.vendorGuid);
-        packet.ItemGuid   = ObjectGuid(intent.itemGuid);
+        packet.ItemGuid   = ObjectGuid(resolvedGuid);
         packet.Count      = intent.quantity;   // 0 = sell whole stack
 
         // Capture pre-sell info for the response payload.
-        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
         std::string itemName;
         uint32      itemEntry = 0;
-        if (item)
+        if (ItemTemplate const* tpl = item->GetTemplate())
         {
-            if (ItemTemplate const* tpl = item->GetTemplate())
-            {
-                itemName  = tpl->Name1;
-                itemEntry = tpl->ItemId;
-            }
+            itemName  = tpl->Name1;
+            itemEntry = tpl->ItemId;
         }
         uint32 moneyBefore = bot->GetMoney();
 
         bot->GetSession()->HandleSellItemOpcode(packet);
 
         uint32 moneyAfter = bot->GetMoney();
-        Item* itemAfter = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        Item* itemAfter = bot->GetItemByGuid(ObjectGuid(resolvedGuid));
         bool soldFully = (itemAfter == nullptr);
 
         return json{
             {"ok",            moneyAfter > moneyBefore || soldFully},
             {"verb",          "sell_item"},
             {"vendor_guid",   intent.vendorGuid},
-            {"item_guid",     intent.itemGuid},
+            {"item_guid",     resolvedGuid},
             {"item_entry",    itemEntry},
             {"item_name",     itemName},
             {"requested",     intent.quantity},
@@ -1126,17 +1142,26 @@ namespace Sbywow
 
     std::string SbywowAgentEngine::ExecuteTradeOfferItem(Player* bot, Intent const& intent)
     {
-        if (!intent.itemGuid)
-            return json{{"ok", false}, {"error", "trade_offer_item requires item_guid"}}.dump();
+        if (!intent.itemGuid && !intent.itemEntry)
+            return json{{"ok", false}, {"error", "trade_offer_item requires item_guid or item_entry"}}.dump();
         if (intent.intParam < 0 || intent.intParam >= TRADE_SLOT_COUNT)
             return json{
                 {"ok", false},
                 {"error", "trade_slot out of range (0-6, where 6 is non-traded)"},
                 {"trade_slot", intent.intParam}
             }.dump();
-        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        Item* item = nullptr;
+        if (intent.itemGuid)
+            item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        else if (intent.itemEntry)
+            item = bot->GetItemByEntry(intent.itemEntry);
         if (!item)
-            return json{{"ok", false}, {"error", "item_guid not in bot's bag"}}.dump();
+            return json{
+                {"ok",         false},
+                {"error",      "item not in bot's bag"},
+                {"item_guid",  intent.itemGuid},
+                {"item_entry", intent.itemEntry}
+            }.dump();
 
         // Handler reads uint8 tradeSlot, uint8 bag, uint8 slot.
         WorldPacket data(CMSG_SET_TRADE_ITEM, 3);
@@ -1149,7 +1174,7 @@ namespace Sbywow
             {"ok",         true},
             {"verb",       "trade_offer_item"},
             {"trade_slot", intent.intParam},
-            {"item_guid",  intent.itemGuid},
+            {"item_guid",  item->GetGUID().GetRawValue()},
             {"item_entry", item->GetTemplate() ? item->GetTemplate()->ItemId : 0}
         }.dump();
     }
@@ -1181,11 +1206,21 @@ namespace Sbywow
     }
     std::string SbywowAgentEngine::ExecuteEquipItem(Player* bot, Intent const& intent)
     {
-        if (!intent.itemGuid)
-            return json{{"ok", false}, {"error", "equip_item requires item_guid"}}.dump();
-        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        if (!intent.itemGuid && !intent.itemEntry)
+            return json{{"ok", false}, {"error", "equip_item requires item_guid or item_entry"}}.dump();
+        Item* item = nullptr;
+        if (intent.itemGuid)
+            item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        else if (intent.itemEntry)
+            item = bot->GetItemByEntry(intent.itemEntry);
         if (!item)
-            return json{{"ok", false}, {"error", "item not in bot's bag"}}.dump();
+            return json{
+                {"ok",         false},
+                {"error",      "item not in bot's bag"},
+                {"item_guid",  intent.itemGuid},
+                {"item_entry", intent.itemEntry}
+            }.dump();
+        uint64_t resolvedGuid = item->GetGUID().GetRawValue();
 
         // intent.intParam: -1 = auto-find slot (the only mode v1
         // supports). Explicit equipment-slot targeting (HandleAutoEquip
@@ -1201,7 +1236,7 @@ namespace Sbywow
         // INVENTORY_SLOT_BAG_0 with slot < EQUIPMENT_SLOT_END the equip
         // succeeded. The handler emits SendEquipError on failure but
         // doesn't return a status here.
-        Item* after = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        Item* after = bot->GetItemByGuid(ObjectGuid(resolvedGuid));
         bool equipped = false;
         uint8 finalSlot = 0;
         if (after)
@@ -1213,7 +1248,7 @@ namespace Sbywow
         return json{
             {"ok",        equipped},
             {"verb",      "equip_item"},
-            {"item_guid", intent.itemGuid},
+            {"item_guid", resolvedGuid},
             {"final_slot", finalSlot},
             {"final_bag",  after ? after->GetBagSlot() : 0}
         }.dump();
@@ -1289,11 +1324,21 @@ namespace Sbywow
 
     std::string SbywowAgentEngine::ExecuteDestroyItem(Player* bot, Intent const& intent)
     {
-        if (!intent.itemGuid)
-            return json{{"ok", false}, {"error", "destroy_item requires item_guid"}}.dump();
-        Item* item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        if (!intent.itemGuid && !intent.itemEntry)
+            return json{{"ok", false}, {"error", "destroy_item requires item_guid or item_entry"}}.dump();
+        Item* item = nullptr;
+        if (intent.itemGuid)
+            item = bot->GetItemByGuid(ObjectGuid(intent.itemGuid));
+        else if (intent.itemEntry)
+            item = bot->GetItemByEntry(intent.itemEntry);
         if (!item)
-            return json{{"ok", false}, {"error", "item not in bot's bag"}}.dump();
+            return json{
+                {"ok",         false},
+                {"error",      "item not in bot's bag"},
+                {"item_guid",  intent.itemGuid},
+                {"item_entry", intent.itemEntry}
+            }.dump();
+        uint64_t resolvedGuid = item->GetGUID().GetRawValue();
 
         ItemTemplate const* tpl = item->GetTemplate();
         std::string itemName = tpl ? tpl->Name1 : std::string{};
@@ -1307,7 +1352,7 @@ namespace Sbywow
             return json{
                 {"ok",         true},
                 {"verb",       "destroy_item"},
-                {"item_guid",  intent.itemGuid},
+                {"item_guid",  resolvedGuid},
                 {"item_entry", itemEntry},
                 {"item_name",  itemName},
                 {"destroyed",  startCount}
@@ -1320,7 +1365,7 @@ namespace Sbywow
         return json{
             {"ok",         true},
             {"verb",       "destroy_item"},
-            {"item_guid",  intent.itemGuid},
+            {"item_guid",  resolvedGuid},
             {"item_entry", itemEntry},
             {"item_name",  itemName},
             {"destroyed",  intent.quantity - toDestroy}  // toDestroy is residual

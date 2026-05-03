@@ -1378,12 +1378,15 @@ namespace Sbywow::Bridge
         {
             if (!req.contains("vendor_guid") || !req["vendor_guid"].is_number())
                 return json{{"ok", false}, {"error", "sell_item requires vendor_guid"}}.dump();
-            if (!req.contains("item_guid") || !req["item_guid"].is_number())
-                return json{{"ok", false}, {"error", "sell_item requires item_guid"}}.dump();
+            bool hasGuid  = req.contains("item_guid")  && req["item_guid"].is_number();
+            bool hasEntry = req.contains("item_entry") && req["item_entry"].is_number();
+            if (!hasGuid && !hasEntry)
+                return json{{"ok", false}, {"error", "sell_item requires item_guid or item_entry"}}.dump();
             Sbywow::Intent i;
             i.kind       = Sbywow::IntentKind::SellItem;
             i.vendorGuid = req["vendor_guid"].get<uint64_t>();
-            i.itemGuid   = req["item_guid"].get<uint64_t>();
+            i.itemGuid   = hasGuid  ? req["item_guid"].get<uint64_t>()  : 0;
+            i.itemEntry  = hasEntry ? req["item_entry"].get<uint32_t>() : 0;
             i.quantity   = req.contains("count") && req["count"].is_number_unsigned()
                            ? req["count"].get<uint32_t>() : 0;  // 0 = sell whole stack
             return Defer(bot, sess, cmd, "sell_item", std::move(i));
@@ -1419,12 +1422,15 @@ namespace Sbywow::Bridge
         {
             if (!req.contains("trade_slot") || !req["trade_slot"].is_number())
                 return json{{"ok", false}, {"error", "trade_offer_item requires trade_slot"}}.dump();
-            if (!req.contains("item_guid") || !req["item_guid"].is_number())
-                return json{{"ok", false}, {"error", "trade_offer_item requires item_guid"}}.dump();
+            bool hasGuid  = req.contains("item_guid")  && req["item_guid"].is_number();
+            bool hasEntry = req.contains("item_entry") && req["item_entry"].is_number();
+            if (!hasGuid && !hasEntry)
+                return json{{"ok", false}, {"error", "trade_offer_item requires item_guid or item_entry"}}.dump();
             Sbywow::Intent i;
-            i.kind     = Sbywow::IntentKind::TradeOfferItem;
-            i.intParam = req["trade_slot"].get<int32_t>();
-            i.itemGuid = req["item_guid"].get<uint64_t>();
+            i.kind      = Sbywow::IntentKind::TradeOfferItem;
+            i.intParam  = req["trade_slot"].get<int32_t>();
+            i.itemGuid  = hasGuid  ? req["item_guid"].get<uint64_t>()  : 0;
+            i.itemEntry = hasEntry ? req["item_entry"].get<uint32_t>() : 0;
             return Defer(bot, sess, cmd, "trade_offer_item", std::move(i));
         }
 
@@ -1462,11 +1468,14 @@ namespace Sbywow::Bridge
                                          std::shared_ptr<PendingCommand>& cmd,
                                          json const& req)
         {
-            if (!req.contains("item_guid") || !req["item_guid"].is_number())
-                return json{{"ok", false}, {"error", "equip_item requires item_guid"}}.dump();
+            bool hasGuid  = req.contains("item_guid")  && req["item_guid"].is_number();
+            bool hasEntry = req.contains("item_entry") && req["item_entry"].is_number();
+            if (!hasGuid && !hasEntry)
+                return json{{"ok", false}, {"error", "equip_item requires item_guid or item_entry"}}.dump();
             Sbywow::Intent i;
-            i.kind     = Sbywow::IntentKind::EquipItem;
-            i.itemGuid = req["item_guid"].get<uint64_t>();
+            i.kind      = Sbywow::IntentKind::EquipItem;
+            i.itemGuid  = hasGuid  ? req["item_guid"].get<uint64_t>()  : 0;
+            i.itemEntry = hasEntry ? req["item_entry"].get<uint32_t>() : 0;
             // optional dest slot — when -1, engine auto-finds suitable slot
             i.intParam = req.contains("dest_slot") && req["dest_slot"].is_number()
                          ? req["dest_slot"].get<int32_t>() : -1;
@@ -1489,11 +1498,14 @@ namespace Sbywow::Bridge
                                            std::shared_ptr<PendingCommand>& cmd,
                                            json const& req)
         {
-            if (!req.contains("item_guid") || !req["item_guid"].is_number())
-                return json{{"ok", false}, {"error", "destroy_item requires item_guid"}}.dump();
+            bool hasGuid  = req.contains("item_guid")  && req["item_guid"].is_number();
+            bool hasEntry = req.contains("item_entry") && req["item_entry"].is_number();
+            if (!hasGuid && !hasEntry)
+                return json{{"ok", false}, {"error", "destroy_item requires item_guid or item_entry"}}.dump();
             Sbywow::Intent i;
-            i.kind     = Sbywow::IntentKind::DestroyItem;
-            i.itemGuid = req["item_guid"].get<uint64_t>();
+            i.kind      = Sbywow::IntentKind::DestroyItem;
+            i.itemGuid  = hasGuid  ? req["item_guid"].get<uint64_t>()  : 0;
+            i.itemEntry = hasEntry ? req["item_entry"].get<uint32_t>() : 0;
             i.quantity = req.contains("count") && req["count"].is_number_unsigned()
                          ? req["count"].get<uint32_t>() : 0;  // 0 = destroy whole stack
             return Defer(bot, sess, cmd, "destroy_item", std::move(i));
